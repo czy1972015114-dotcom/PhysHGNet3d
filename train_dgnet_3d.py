@@ -316,7 +316,7 @@ def parse_args():
     p.add_argument("--data_dir",    type=str,   default="data_laser_hardening_3d")
     p.add_argument("--ckpt_dir",    type=str,   default="checkpoints/dgnet_3d")
     p.add_argument("--epochs",      type=int,   default=100)
-    p.add_argument("--batch_size",  type=int,   default=4)
+    p.add_argument("--batch_size",  type=int,   default=2)
     p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--window_size", type=int,   default=10)
     p.add_argument("--stride",      type=int,   default=None)

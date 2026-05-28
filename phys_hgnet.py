@@ -1,15 +1,20 @@
 """
-phys_hgnet.py  ← 锚点选择器重写版（含热源感知）
-=================================
-改动说明（相比上一版，仅修复一处 bug）：
+phys_hgnet.py  ← DDP 兼容版（anchor_scores 移入 forward 统一管理）
+=================================================================
+相比上一版的改动（2 处）：
 
-Bug 修复：_build_graph 中 _temp 提取逻辑错误
-  原版：u_init[:, 0] 在 u_init 形状为 (B, N, C) 时
-        得到 (B, C) 而非 (N,)，导致 score_nodes 里
-        torch.stack 报 size mismatch。
-  修复：根据 u_init 的 dim 分情况提取，保证 _temp 始终是 (N,)。
+改动 1（_build_graph）：
+  anchor_selector 调用套 torch.no_grad()
+  ── 原因：top-k 索引本就不可微；no_grad 告诉 DDP 此处不参与
+          反向计算，避免 DDP hook 将 scorer 参数标记为"已使用"。
 
-原版数值稳定修复（Fix A/B/C/D）以及锚点 MLP 改动全部保留。
+改动 2（forward 末尾）：
+  在 forward() 里（DDP 上下文内）对 scorer 做一次带梯度的
+  score_nodes() 调用，把结果作为 "anchor_scores" 放入输出 dict。
+  训练脚本直接从 out["anchor_scores"] 计算 anchor_focus_loss，
+  不再在 forward 外部单独调用 selector，彻底消除"参数标记两次"。
+
+原版数值稳定修复（Fix A/B/C/D）全部保留。
 """
 
 import math
@@ -27,7 +32,7 @@ from structured_models import (
 from structured_dgnet import ImplicitCGSolve, _precond_cg_solve, ResidualSolver as _OrigResidualSolver
 from phys_hgnet_modules import (
     PhysicsAwareAnchorSelector, LearnableCoarseOperator, DualScaleGNNCorrector,
-    build_restriction_prolongation, build_coarse_edge_attr,
+    build_restriction_prolongation, build_coarse_edge_attr, _to_node_field,
 )
 from gradient_utils import compute_gradient_norm
 
@@ -104,37 +109,10 @@ def _apply_bcs(u, boundary_info):
     return u
 
 
-def _extract_node_field(t: Optional[torch.Tensor], N: int) -> Optional[torch.Tensor]:
-    """
-    从任意形状的张量中安全提取 (N,) 的节点标量场。
-    支持输入形状：(N,) / (N,1) / (B,N,C) / (B,N) 等。
-    若无法提取或形状不匹配则返回 None。
-    """
-    if t is None:
-        return None
-    t = t.detach()
-    # 展平所有维度，按节点数切分
-    if t.dim() == 1 and t.shape[0] == N:
-        return t.float()
-    if t.dim() == 2:
-        # (N, C) → 取第 0 列
-        if t.shape[0] == N:
-            return t[:, 0].float()
-        # (B, N) → 取第 0 个 batch
-        if t.shape[1] == N:
-            return t[0].float()
-    if t.dim() == 3:
-        # (B, N, C) → 取第 0 个 batch、第 0 个通道
-        if t.shape[1] == N:
-            return t[0, :, 0].float()
-    # 无法匹配，返回 None 而不是崩溃
-    return None
-
-
 class PhysHGNet(nn.Module):
     """
     Physics-aware Hierarchical Graph Neural Operator.
-    （锚点选择器重写版 + 原版数值稳定修复保留）
+    （DDP 兼容版：anchor_scores 统一在 forward 内计算）
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -197,11 +175,13 @@ class PhysHGNet(nn.Module):
 
     def _build_graph(self, nodes, edges, L_physics, node_volumes=None,
                      node_type=None, u_init=None):
+        if self._source_q_cache is None:
+             self._source_q_cache = src_terms[0, -1, :, 0].detach()
         N      = nodes.shape[0]
         device = nodes.device
         fine_ei = build_bidirectional_edges(edges)
         fine_ea = build_edge_features(nodes, fine_ei)
-
+    
         if isinstance(L_physics, dict) and L_physics.get("type") == "sparse":
             sp_ei, sp_w = L_physics["edge_index"], L_physics["edge_weights"]
         else:
@@ -216,16 +196,13 @@ class PhysHGNet(nn.Module):
 
         m_target = min(self.m_anchors, max(8, N // 16))
 
-        # ── 安全提取 (N,) 的热源和温度场 ──────────────────────────────
-        # _extract_node_field 能处理 (B,N,C)/(N,C)/(N,) 等任意形状，
-        # 不匹配时返回 None 而不是崩溃。
-        _src_q = _extract_node_field(self._source_q_cache, N)
-        _temp  = _extract_node_field(u_init, N)
-
-        # _build_graph 内的调用套 no_grad：topk 返回 long 索引本就不可微，
-        # 同时避免 DDP 把 scorer 参数标记为"在 forward 中已使用"，
-        # 让梯度完全由 compute_anchor_focus_loss 的独立调用来传。
+        # ── 改动 1：no_grad 包裹，top-k 索引不参与反向 ──────────────
+        # DDP 要求每个参数在 forward 里只被计算图追踪一次。
+        # scorer 的带梯度调用统一放在 forward() 末尾（anchor_scores）。
+        # 此处只做 argmax/topk 选锚点，不需要梯度。
         with torch.no_grad():
+            _src_q = _to_node_field(self._source_q_cache, N)
+            _temp  = _to_node_field(u_init, N)
             anchor_idx = self.anchor_selector(
                 nodes, m_target,
                 source_q=_src_q,
@@ -234,6 +211,7 @@ class PhysHGNet(nn.Module):
                 grad_norm=self._grad_norm_cache,
                 use_physics_anchor=self.use_physics_anchor,
             )
+
         anchor_coords = nodes[anchor_idx]
         m = anchor_idx.shape[0]
 
@@ -326,17 +304,17 @@ class PhysHGNet(nn.Module):
                 except Exception:
                     L_physics = torch.zeros(N, N, device=device)
 
-            # 缓存热源强度（取第 0 batch、最后时刻）供 _build_graph 使用
-            _st = src_terms  # (B, T, N, C)
+            # 缓存热源强度，供 _build_graph no_grad 分支使用
+            _st = src_terms
             if _st.shape[1] > 0:
-                self._source_q_cache = _st[0, -1, :, 0].detach()  # (N,)
+                self._source_q_cache = _st[0, -1, :, 0].detach()
             else:
                 self._source_q_cache = None
 
             self._graph_cache = self._build_graph(
                 nodes, edges, L_physics,
                 node_volumes=batch.get("node_volumes"),
-                node_type=node_type, u_init=u_init)   # 传整个 u_init，由 _extract_node_field 处理
+                node_type=node_type, u_init=u_init)
             self._cache_key = cache_key
 
         gc = self._graph_cache
@@ -358,7 +336,7 @@ class PhysHGNet(nn.Module):
             f_cur  = src_terms[:, t]
             f_next = src_terms[:, t + 1]
 
-            # ── 更新 C1 缓存 ───────────────────────────────────────
+            # ── 更新残差 / 梯度缓存 ────────────────────────────────
             if _pa and (self._step_counter % self.res_upd_freq == 0):
                 with torch.no_grad():
                     u0 = u_curr[0, :, 0]
@@ -382,7 +360,7 @@ class PhysHGNet(nn.Module):
             for b in range(B):
                 u_b = u_curr[b]
 
-                # Fix C: 减去均值，在较小量级上求解
+                # Fix C: 减去均值，降低 float32 精度损失
                 u_b_flat = u_b[:, 0]
                 u_mean   = u_b_flat.mean()
                 u_c      = u_b_flat - u_mean
@@ -438,7 +416,23 @@ class PhysHGNet(nn.Module):
             u_hist[:, t + 1] = u_next
             u_curr = u_next.detach()
 
-        return {"u_final": u_hist}
+        # ── 改动 2：anchor_scores 在 forward() 内（DDP 上下文内）计算 ──
+        # 带梯度调用只发生一次，DDP 不会看到重复标记。
+        # 训练脚本从 out["anchor_scores"] 算 anchor_focus_loss，
+        # 不再在 forward 外部单独调用 selector。
+        anchor_scores = None
+        if self.training and _pa and hasattr(self.anchor_selector, "score_nodes"):
+            _q = _to_node_field(self._source_q_cache, N)
+            _t = _to_node_field(u_init, N)
+            anchor_scores = self.anchor_selector.score_nodes(
+                nodes,
+                source_q=_q,
+                temperature=_t,
+                residual=self._residual_cache,
+                grad_norm=self._grad_norm_cache,
+            )   # (N,)，可微
+
+        return {"u_final": u_hist, "anchor_scores": anchor_scores}
 
     # ── utilities ───────────────────────────────────────────────────
 
