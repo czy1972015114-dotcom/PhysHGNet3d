@@ -1,9 +1,13 @@
 """
-train_dgnet_3d.py — DGNet3D 基线训练脚本
-=========================================
-修复：all_reduce_metrics 后 d 不再多除 world_size（指标放大 bug）
+train_dgnet_3d.py — DGNet3D 训练脚本（与 DGNet 仓库对齐）
 
-与 train_phys_hgnet_3d.py 接口完全对称，确保对比实验控制变量一致。
+与旧版的关键变化
+----------------
+1. 损失函数：只在 t=1 和 t=T-1 计算（对应 StructuredDGNetLoss），
+   不再对全序列 MSE，避免 StructuredDGNet 中间时间步填充 u_{T-1}
+   导致 loss 虚低的问题。
+2. m_anchors 默认 64，与 DGNet 仓库一致（不做 N//12 缩放）。
+3. 其余训练超参与 train_phys_hgnet_3d.py 保持对称，确保对比公平。
 """
 
 import argparse, json, os, time
@@ -24,13 +28,11 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from dgnet_3d    import DGNet3D, DEFAULT_CONFIG_DGNET3D
-from dataset_3d  import LaserHardening3DDataset, collate_fn_3d, find_h5_file
+from dgnet_3d import DGNet3D, DEFAULT_CONFIG_DGNET3D
+from dataset_3d import LaserHardening3DDataset, collate_fn_3d, find_h5_file
 
 
-# ─────────────────────────────────────────────────────────────────
-# DDP
-# ─────────────────────────────────────────────────────────────────
+# ── DDP ──────────────────────────────────────────────────────────
 
 def setup_ddp():
     if "RANK" not in os.environ:
@@ -42,13 +44,13 @@ def setup_ddp():
     torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
 
+
 def cleanup_ddp():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-# ─────────────────────────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────────────────────────
+
+# ── 工具 ─────────────────────────────────────────────────────────
 
 def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     out = {}
@@ -78,14 +80,29 @@ def all_reduce_metrics(metrics, device, world_size):
         return metrics
     keys   = list(metrics.keys())
     tensor = torch.tensor([metrics[k] for k in keys],
-                           dtype=torch.float64, device=device)
+                          dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= world_size
     return {k: float(tensor[i]) for i, k in enumerate(keys)}
 
-# ─────────────────────────────────────────────────────────────────
-# Epoch（含进度条）
-# ─────────────────────────────────────────────────────────────────
+
+# ── 损失（与 StructuredDGNetLoss 对齐） ──────────────────────────
+
+def dgnet_loss(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """
+    只在 t=1 和 t=T-1 计算损失。
+    StructuredDGNet 的中间时间步是用 u_cur.detach() 填充的，
+    不含梯度，全序列 MSE 会掩盖中间步的错误。
+    与 StructuredDGNetLoss 严格对齐。
+    """
+    pred = pred.float()
+    tgt  = tgt.float()
+    l1 = F.mse_loss(pred[:, 1], tgt[:, 1])
+    lT = F.mse_loss(pred[:, -1], tgt[:, -1])
+    return l1 + lT
+
+
+# ── Epoch ─────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, optimizer, device, is_train,
               scaler=None, rank=0, world_size=1, epoch_desc="train"):
@@ -95,25 +112,32 @@ def run_epoch(model, loader, optimizer, device, is_train,
 
     show_bar = (rank == 0 and HAS_TQDM)
     bar = tqdm(loader, desc=epoch_desc, leave=False,
-               ncols=90, disable=not show_bar)
-
+               ncols=110, disable=not show_bar)
     ctx = torch.enable_grad() if is_train else torch.no_grad()
+
     with ctx:
         for batch in bar:
             batch = batch_to_device(batch, device)
             tgt   = batch["targets"]
-
             amp_on = (scaler is not None)
+
             with torch.amp.autocast('cuda', enabled=amp_on):
                 out  = model(batch)
                 pred = out["u_final"]
+
                 if not torch.isfinite(pred).all().item():
                     n_nan += 1
                     pred = torch.nan_to_num(pred, nan=298.15,
                                             posinf=2000.0, neginf=0.0)
-                mse  = F.mse_loss(pred, tgt)
-                rne  = (pred - tgt).norm() / tgt.norm().clamp(min=1e-8)
-                loss = mse + 0.01 * F.relu(-pred).mean()
+
+                # 与 StructuredDGNetLoss 对齐：t=1 + t=T-1
+                loss = dgnet_loss(pred, tgt)
+
+                # RNE 用全序列（仅用于监控，不影响梯度）
+                with torch.no_grad():
+                    rne = ((pred.float() - tgt.float()).norm() /
+                           tgt.float().norm().clamp(min=1e-8))
+                mse_last = F.mse_loss(pred[:, -1].float(), tgt[:, -1].float())
 
             if is_train:
                 optimizer.zero_grad()
@@ -130,12 +154,12 @@ def run_epoch(model, loader, optimizer, device, is_train,
                     nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     optimizer.step()
 
-            sum_mse += mse.item()
+            sum_mse += mse_last.item()
             sum_rne += rne.item()
             n_ok    += 1
 
             if show_bar:
-                bar.set_postfix(mse=f"{mse.item():.3f}",
+                bar.set_postfix(mse=f"{mse_last.item():.2f}",
                                 rne=f"{rne.item():.4f}")
 
     if show_bar:
@@ -145,16 +169,16 @@ def run_epoch(model, loader, optimizer, device, is_train,
         {"mse": sum_mse, "rne": sum_rne,
          "n_ok": float(n_ok), "n_nan": float(n_nan)},
         device, world_size)
-    d = max(int(agg["n_ok"]), 1)   # 修复：不除 world_size
+
+    d = max(int(agg["n_ok"]), 1)
     return {
         "mse"        : agg["mse"] / d,
         "rne"        : agg["rne"] / d,
         "nan_batches": int(agg["n_nan"]),
     }
 
-# ─────────────────────────────────────────────────────────────────
-# 主训练循环
-# ─────────────────────────────────────────────────────────────────
+
+# ── 主训练循环 ────────────────────────────────────────────────────
 
 def train(args):
     rank, local_rank, world_size = setup_ddp()
@@ -163,11 +187,11 @@ def train(args):
         f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     h5_path = find_h5_file(args.data_dir, args.n_nodes)
-
     import h5py
     with h5py.File(str(h5_path), 'r') as f:
-        all_keys = sorted([k for k in f.keys() if k.startswith('trajectory_')],
-                          key=lambda x: int(x.split('_')[1]))
+        all_keys = sorted(
+            [k for k in f.keys() if k.startswith('trajectory_')],
+            key=lambda x: int(x.split('_')[1]))
     n_traj  = len(all_keys)
     n_train = int(n_traj * 0.8)
     train_ti = list(range(n_train))
@@ -180,45 +204,49 @@ def train(args):
         str(h5_path), window_size=args.window_size, stride=args.stride,
         traj_indices=val_ti)
 
+    # m_anchors: 与 DGNet 仓库默认 64 对齐，或用 N//32 适度缩放
+    if args.m_anchors is None:
+        args.m_anchors = max(32, min(64, train_ds.N // 32))
+
     if is_main:
-        print(f"╔{'═'*64}╗")
-        print(f"║  DGNet3D (baseline)  |  N={train_ds.N}  |  {world_size} GPU(s)")
-        print(f"║  window={args.window_size}  stride={args.stride}  "
-              f"lr={args.lr}  bs={args.batch_size}")
-        print(f"╚{'═'*64}╝")
+        print(f"╔{'═'*68}╗")
+        print(f"║  DGNet3D (StructuredDGNet backbone)  "
+              f"N={train_ds.N}  world={world_size} GPU(s)")
+        print(f"║  m_anchors={args.m_anchors}  "
+              f"hidden={args.hidden_dim}×{args.n_layers}L")
+        print(f"╚{'═'*68}╝")
         print(train_ds.info())
-        print(f"  训练窗口={len(train_ds)} | val窗口={len(val_ds)}"
-              f" | batch={args.batch_size}")
 
     if world_size > 1:
-        tr_sampler = DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-        va_sampler = DistributedSampler(
-            val_ds,   num_replicas=world_size, rank=rank, shuffle=False)
+        tr_sampler = DistributedSampler(train_ds, num_replicas=world_size,
+                                        rank=rank, shuffle=True)
+        va_sampler = DistributedSampler(val_ds,   num_replicas=world_size,
+                                        rank=rank, shuffle=False)
         tr_shuffle = False
     else:
         tr_sampler = va_sampler = None
         tr_shuffle = True
 
-    tr_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
-        sampler=tr_sampler, shuffle=tr_shuffle,
-        collate_fn=collate_fn_3d, num_workers=args.num_workers, drop_last=True)
-    va_loader = DataLoader(
-        val_ds,   batch_size=args.batch_size,
-        sampler=va_sampler, shuffle=False,
-        collate_fn=collate_fn_3d, num_workers=args.num_workers)
+    tr_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                           sampler=tr_sampler, shuffle=tr_shuffle,
+                           collate_fn=collate_fn_3d,
+                           num_workers=args.num_workers, drop_last=True)
+    va_loader = DataLoader(val_ds,   batch_size=args.batch_size,
+                           sampler=va_sampler, shuffle=False,
+                           collate_fn=collate_fn_3d, num_workers=args.num_workers)
 
     model_cfg = {
         **DEFAULT_CONFIG_DGNET3D,
-        "residual_hidden_dim" : args.hidden_dim,
-        "residual_num_layers" : args.n_layers,
+        "m_anchors"          : args.m_anchors,
+        "residual_hidden_dim": args.hidden_dim,
+        "residual_num_layers": args.n_layers,
     }
+
     model = DGNet3D(model_cfg).to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank],
-                    find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     raw_model = model.module if world_size > 1 else model
+
     if is_main:
         print(raw_model.extra_info())
 
@@ -242,39 +270,37 @@ def train(args):
         start_epoch = ckpt["epoch"] + 1
         best_rne    = ckpt["best_rne"]
         if is_main:
-            print(f"  ↩ 恢复 epoch={start_epoch}  best_rne={best_rne:.4f}")
+            print(f"  ↩ 恢复 epoch={start_epoch} best_rne={best_rne:.4f}")
 
     log = []
-    epoch_bar = (tqdm(range(start_epoch, args.epochs),
-                      desc="DGNet3D", unit="ep", ncols=90)
-                 if (is_main and HAS_TQDM) else range(start_epoch, args.epochs))
+    epoch_iter = (tqdm(range(start_epoch, args.epochs),
+                       desc="DGNet3D", unit="ep", ncols=110)
+                  if (is_main and HAS_TQDM) else range(start_epoch, args.epochs))
 
-    for epoch in epoch_bar:
+    for epoch in epoch_iter:
         if world_size > 1:
             tr_sampler.set_epoch(epoch)
 
         t0   = time.time()
         tr_m = run_epoch(model, tr_loader, optimizer, device,
-                         is_train=True,  scaler=scaler,
+                         is_train=True, scaler=scaler,
                          rank=rank, world_size=world_size,
-                         epoch_desc=f"  train ep{epoch+1}")
+                         epoch_desc=f" train ep{epoch+1}")
         va_m = run_epoch(model, va_loader, None, device,
                          is_train=False,
                          rank=rank, world_size=world_size,
-                         epoch_desc=f"  val   ep{epoch+1}")
+                         epoch_desc=f" val   ep{epoch+1}")
         scheduler.step()
 
         if is_main:
             elapsed = time.time() - t0
-            nan_s   = f" NaN={tr_m['nan_batches']}" if tr_m["nan_batches"] else ""
-            line    = (f"Ep {epoch+1:>4}/{args.epochs} | "
-                       f"tr MSE={tr_m['mse']:>10.3f} RNE={tr_m['rne']:.4f} | "
-                       f"va MSE={va_m['mse']:>10.3f} RNE={va_m['rne']:.4f} | "
-                       f"{elapsed:.1f}s{nan_s}")
+            nan_s = f" NaN={tr_m['nan_batches']}" if tr_m["nan_batches"] else ""
+            line  = (f"Ep {epoch+1:>4}/{args.epochs} | "
+                     f"tr MSE={tr_m['mse']:>9.2f} RNE={tr_m['rne']:.4f} | "
+                     f"va MSE={va_m['mse']:>9.2f} RNE={va_m['rne']:.4f} | "
+                     f"{elapsed:.1f}s{nan_s}")
             if HAS_TQDM:
-                epoch_bar.set_postfix(
-                    va_rne=f"{va_m['rne']:.4f}",
-                    tr_rne=f"{tr_m['rne']:.4f}")
+                epoch_iter.set_postfix(va_rne=f"{va_m['rne']:.4f}")
                 tqdm.write(line)
             else:
                 print(line)
@@ -284,19 +310,20 @@ def train(args):
                 "train_mse": tr_m["mse"], "train_rne": tr_m["rne"],
                 "val_mse"  : va_m["mse"], "val_rne"  : va_m["rne"],
             })
-            cur = va_m["rne"]
-            if 0 < cur < best_rne:
-                best_rne = cur
-                torch.save({
-                    "model"    : raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "epoch"    : epoch,
-                    "best_rne" : best_rne,
-                    "config"   : model_cfg,
-                }, ckpt_path)
-                msg = f"  ✓ 保存最优 (RNE={best_rne:.4f})"
-                tqdm.write(msg) if HAS_TQDM else print(msg)
+
+        cur = va_m["rne"]
+        if is_main and 0 < cur < best_rne:
+            best_rne = cur
+            torch.save({
+                "model"    : raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch"    : epoch,
+                "best_rne" : best_rne,
+                "config"   : model_cfg,
+            }, ckpt_path)
+            msg = f"  ✓ 保存最优 (val RNE={best_rne:.4f})"
+            tqdm.write(msg) if HAS_TQDM else print(msg)
 
     if is_main:
         with open(ckpt_dir / f"train_log_{train_ds.N}.json", "w") as f:
@@ -306,29 +333,31 @@ def train(args):
 
     cleanup_ddp()
 
-# ─────────────────────────────────────────────────────────────────
-# 参数解析
-# ─────────────────────────────────────────────────────────────────
+
+# ── 参数解析 ──────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="DGNet3D 基线训练")
-    p.add_argument("--n_nodes",     type=int,   default=1000)
-    p.add_argument("--data_dir",    type=str,   default="data_laser_hardening_3d")
-    p.add_argument("--ckpt_dir",    type=str,   default="checkpoints/dgnet_3d")
-    p.add_argument("--epochs",      type=int,   default=100)
-    p.add_argument("--batch_size",  type=int,   default=2)
-    p.add_argument("--lr",          type=float, default=3e-4)
-    p.add_argument("--window_size", type=int,   default=10)
-    p.add_argument("--stride",      type=int,   default=None)
-    p.add_argument("--hidden_dim",  type=int,   default=128)
-    p.add_argument("--n_layers",    type=int,   default=5)
-    p.add_argument("--num_workers", type=int,   default=0)
-    p.add_argument("--amp",         action="store_true")
-    p.add_argument("--resume",      action="store_true")
+    p = argparse.ArgumentParser(description="DGNet3D 训练（StructuredDGNet 对齐）")
+    p.add_argument("--n_nodes",    type=int,   default=4000)
+    p.add_argument("--data_dir",   type=str,   default="data_laser_hardening_3d")
+    p.add_argument("--ckpt_dir",   type=str,   default="checkpoints/dgnet_3d")
+    p.add_argument("--epochs",     type=int,   default=100)
+    p.add_argument("--batch_size", type=int,   default=2)
+    p.add_argument("--lr",         type=float, default=3e-4)
+    p.add_argument("--window_size",type=int,   default=10)
+    p.add_argument("--stride",     type=int,   default=None)
+    p.add_argument("--m_anchors",  type=int,   default=None,
+                   help="None=自动 max(32, min(64, N//32))，与 DGNet 仓库对齐")
+    p.add_argument("--hidden_dim", type=int,   default=128)
+    p.add_argument("--n_layers",   type=int,   default=5)
+    p.add_argument("--num_workers",type=int,   default=0)
+    p.add_argument("--amp",        action="store_true")
+    p.add_argument("--resume",     action="store_true")
     args = p.parse_args()
     if args.stride is None:
         args.stride = max(1, args.window_size // 2)
     return args
+
 
 if __name__ == "__main__":
     train(parse_args())
