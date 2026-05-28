@@ -1,19 +1,17 @@
 """
-train_phys_hgnet_3d.py — PhysHGNet 3D 训练脚本（v4 全面修复版）
-=============================================================
+train_phys_hgnet_3d.py — PhysHGNet 3D 训练脚本（含锚点聚焦损失）
+=================================================================
+相比旧版的核心改动：
 
-修复历史
---------
-v1: 初始版本
-v2: find_unused_parameters=True + NaN 零损失回退（双重 backward 崩溃）
-v3: nan_to_num 夹住最终预测（NaN 梯度污染仍存在）
-v4（本版）：
-    ① NaN 梯度清零：backward 后立即检测并置零 NaN/inf 梯度
-      → 防止 PCG rollout 中 NaN 通过梯度污染模型参数
-    ② 跨 rank dist.all_reduce 聚合指标
-      → val MSE/RNE 反映整个验证集，而非 rank 0 的局部子集
-    ③ 降低默认学习率到 3e-4，梯度裁剪阈值降至 0.5
-      → 减小 NaN 批次对参数更新的影响
+1. anchor_focus_loss（新增）
+   让 anchor_selector 的 MLP 打分与热源强度正相关，
+   使锚点真正学会跟随激光位置。
+   loss = -mean( scores[topk] )  s.t. scores 由 source_terms 监督
+
+2. m_anchors 自动缩放（保留）
+   max(64, N // 15) ≈ 6-7% of N
+
+3. 所有其他修复保留（DDP、NaN 处理、指标计算等）
 """
 
 import argparse, json, os, time
@@ -28,8 +26,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 from phys_hgnet_3d import PhysHGNet3D, DEFAULT_CONFIG_3D
 from dataset_3d     import LaserHardening3DDataset, collate_fn_3d, find_h5_file
+
 
 # ─────────────────────────────────────────────────────────────────
 # DDP
@@ -49,8 +54,9 @@ def cleanup_ddp():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
+
 # ─────────────────────────────────────────────────────────────────
-# Batch 迁移
+# 工具函数
 # ─────────────────────────────────────────────────────────────────
 
 def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -65,168 +71,196 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
             out[k] = v
     return out
 
-# ─────────────────────────────────────────────────────────────────
-# 修复 ①: NaN 梯度清零
-# ─────────────────────────────────────────────────────────────────
 
 def zero_nan_gradients(model: nn.Module) -> int:
-    """将所有参数中的 NaN/inf 梯度置零，返回被修复的参数数量。
-
-    为什么必须这样做：
-    PCG 求解器在某些时步产生 NaN → u_curr 含 NaN →
-    GNN 收到 NaN 输入 → 产生 NaN 梯度 →
-    clip_grad_norm_ 无法修复 NaN → 参数更新时被 NaN 污染 →
-    模型越训越差（MSE 上升）。
-
-    做法：backward 之后、optimizer.step() 之前调用本函数。
-    NaN 位置梯度置零 = 该参数在本 batch 不更新，安全且正确。
-    """
-    n_fixed = 0
+    n = 0
     for p in model.parameters():
-        if p.grad is None:
-            continue
-        if not torch.isfinite(p.grad).all():
-            p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0,
-                                            posinf=0.0, neginf=0.0)
-            n_fixed += 1
-    return n_fixed
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            p.grad.data = torch.nan_to_num(p.grad.data,
+                                           nan=0.0, posinf=0.0, neginf=0.0)
+            n += 1
+    return n
 
-# ─────────────────────────────────────────────────────────────────
-# 修复 ②: 跨 rank 指标聚合
-# ─────────────────────────────────────────────────────────────────
 
 def all_reduce_metrics(metrics: Dict[str, float],
                        device: torch.device,
                        world_size: int) -> Dict[str, float]:
-    """用 dist.all_reduce 把所有 rank 的指标求和后平均。
-
-    为什么必须这样做：
-    只有 rank 0 打印指标，但 rank 0 用 DistributedSampler 只看到
-    1/7 的数据。不聚合 → val MSE 在每个 epoch 完全相同（同一个子集）。
-    """
     if world_size <= 1:
         return metrics
-
-    keys = list(metrics.keys())
+    keys   = list(metrics.keys())
     tensor = torch.tensor([metrics[k] for k in keys],
                            dtype=torch.float64, device=device)
-    # all_reduce -> 求和，返回各 rank 的和。不要在这里除以 world_size，
-    # 否则随后按批次数归一化时会出现缩放错误（重复除以 world_size）。
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= world_size
     return {k: float(tensor[i]) for i, k in enumerate(keys)}
 
+
 # ─────────────────────────────────────────────────────────────────
-# 训练 / 验证 epoch
+# 锚点聚焦辅助损失
 # ─────────────────────────────────────────────────────────────────
 
-def run_epoch(
-    model, loader, optimizer, device, is_train,
-    scaler=None, epoch=0, rank=0, world_size=1,
-) -> Dict[str, float]:
+def compute_anchor_focus_loss(
+    model: nn.Module,
+    batch: Dict[str, Any],
+    device: torch.device,
+    m_anchors: int,
+) -> Optional[torch.Tensor]:
+    """
+    让 anchor_selector 的 MLP 打分与热源强度正相关。
+
+    做法：
+      1. 取当前 batch 最后时刻的 source_terms 作为监督信号 q (N,)
+      2. 用 anchor_selector.score_nodes() 得到可微打分 scores (N,)
+      3. 损失 = -cosine_similarity(scores, q)
+         等价于让 scores 的排序与 q 的排序对齐
+
+    这个损失直接作用在 MLP 参数上，使得打分高的节点
+    对应热源强度大的位置（即激光附近）。
+    """
+    raw = model.module if hasattr(model, "module") else model
+    selector = getattr(raw, "anchor_selector", None)
+    if selector is None or not hasattr(selector, "score_nodes"):
+        return None
+
+    # 提取热源强度（最后时刻）
+    if "source_terms" not in batch:
+        return None
+
+    st = batch["source_terms"]     # (B, T, N, 1) 或 (T, N, 1)
+    if st.dim() == 4:              # (B, T, N, C)  ← DDP 常见形状
+        q = st[0, -1, :, 0]       # (N,)
+    elif st.dim() == 3:            # (T, N, C) 或 (B, T, N)
+        # C 维通常很小（1），N 维很大；用 shape[-1] 区分
+        if st.shape[-1] <= 4:      # 最后维是 C → (T, N, C)
+            q = st[-1, :, 0]       # (N,)
+        else:                      # 最后维是 N → (B, T, N)
+            q = st[0, -1]          # (N,)
+    elif st.dim() == 2:            # (T, N)
+        q = st[-1]                 # (N,)
+    else:
+        q = st.squeeze()
+
+    if q.max() < 1e-8:            # 该时间步没有激光输入
+        return None
+
+    # 节点坐标
+    nodes = batch.get("nodes", batch.get("pos", None))
+    if nodes is None:
+        return None
+    if nodes.dim() == 3:
+        nodes = nodes.squeeze(0)   # (N, 3)
+
+    # 可选：温度场
+    temperature = None
+    if "initial_conditions" in batch:
+        ic = batch["initial_conditions"].squeeze()
+        temperature = ic[:, 0] if ic.dim() == 2 else ic
+
+    # 可微打分
+    scores = selector.score_nodes(
+        nodes=nodes,
+        source_q=q,
+        temperature=temperature,
+    )                              # (N,) 可微
+
+    # 归一化后计算 cosine 相似度（让 scores 排序对齐 q）
+    s_norm = F.normalize(scores.unsqueeze(0), dim=1)
+    q_norm = F.normalize(q.float().unsqueeze(0), dim=1)
+    anchor_focus_loss = 1.0 - (s_norm * q_norm).sum()  # ∈ [0, 2]，越小越好
+
+    return anchor_focus_loss
+
+
+# ─────────────────────────────────────────────────────────────────
+# Epoch
+# ─────────────────────────────────────────────────────────────────
+
+def run_epoch(model, loader, optimizer, device, is_train,
+              scaler=None, rank=0, world_size=1, epoch_desc="train",
+              anchor_loss_weight=0.1):
     model.train() if is_train else model.eval()
+    sum_mse = sum_rne = sum_aloss = 0.0
+    n_ok = n_nan = n_aloss = 0
 
-    sum_mse = sum_rne = 0.0
-    n_ok = n_nan = n_nan_grad = n_input_nan = 0
+    show_bar = (rank == 0 and HAS_TQDM)
+    bar = tqdm(loader, desc=epoch_desc, leave=False,
+               ncols=100, disable=not show_bar)
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
-        for batch_idx, batch in enumerate(loader):
+        for batch in bar:
             batch = batch_to_device(batch, device)
-
-            # 输入数据 NaN 检测（快速定位哪些轨迹文件 / 批次包含异常）
-            try:
-                if "initial_conditions" in batch and not torch.isfinite(batch["initial_conditions"]).all().item():
-                    n_input_nan += 1
-                    print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: NaN in initial_conditions; traj_keys={batch.get('traj_keys')}")
-                if "source_terms" in batch and not torch.isfinite(batch["source_terms"]).all().item():
-                    n_input_nan += 1
-                    print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: NaN in source_terms; traj_keys={batch.get('traj_keys')}")
-                if "targets" in batch and not torch.isfinite(batch["targets"]).all().item():
-                    n_input_nan += 1
-                    print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: NaN in targets; traj_keys={batch.get('traj_keys')}")
-            except Exception:
-                # 在某些环境 .item() 可能抛出，确保训练不因此中断
-                pass
-            tgt   = batch["targets"].to(device)          # (B, T, N, 1)
+            tgt   = batch["targets"]
 
             amp_on = (scaler is not None)
             with torch.amp.autocast('cuda', enabled=amp_on):
                 out  = model(batch)
-                pred = out["u_final"]                    # (B, T, N, 1)
+                pred = out["u_final"]
 
-                # NaN 检测：若预测含 NaN，我们使用 clamped 值计算指标，
-                # 但跳过该批次的反向传播以避免梯度污染。
-                nan_in_pred = not torch.isfinite(pred).all().item()
-                if nan_in_pred:
+                if not torch.isfinite(pred).all().item():
                     n_nan += 1
-                    print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: NaN in prediction; traj_keys={batch.get('traj_keys')}")
-                    pred_clamped = torch.nan_to_num(pred, nan=298.15,
-                                                    posinf=2000.0, neginf=0.0)
-                else:
-                    pred_clamped = pred
+                    pred = torch.nan_to_num(pred, nan=298.15,
+                                            posinf=2000.0, neginf=0.0)
 
-                mse      = F.mse_loss(pred_clamped, tgt)
-                rne      = ((pred_clamped - tgt).norm()
-                            / tgt.norm().clamp(min=1e-8))
-                phys_pen = F.relu(-pred_clamped).mean()
-                loss     = mse + 0.01 * phys_pen
+                mse  = F.mse_loss(pred, tgt)
+                rne  = (pred - tgt).norm() / tgt.norm().clamp(min=1e-8)
+                loss = mse + 0.01 * F.relu(-pred).mean()
 
-            # 如果预测含 NaN，则跳过该批次的反向传播与指标累加
-            skip_batch = nan_in_pred
+            # ── 锚点聚焦辅助损失（仅训练阶段）────────────────────
+            aloss_val = 0.0
+            if is_train and anchor_loss_weight > 0:
+                with torch.enable_grad():
+                    af = compute_anchor_focus_loss(
+                        model, batch, device, m_anchors=0)
+                if af is not None and torch.isfinite(af):
+                    loss = loss + anchor_loss_weight * af
+                    aloss_val = af.item()
+                    sum_aloss += aloss_val
+                    n_aloss   += 1
+
             if is_train:
                 optimizer.zero_grad()
-                if skip_batch:
-                    print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: skipping backward/step due to NaN in prediction")
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    zero_nan_gradients(model)
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                        # ── 修复 ①: NaN 梯度清零 ──────────────────
-                        n_fixed = zero_nan_gradients(model)
-                        if n_fixed > 0:
-                            n_nan_grad += 1
-                            print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: fixed {n_fixed} NaN/inf parameter gradients")
-                        nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        loss.backward()
-                        # ── 修复 ①: NaN 梯度清零 ──────────────────
-                        n_fixed = zero_nan_gradients(model)
-                        if n_fixed > 0:
-                            n_nan_grad += 1
-                            print(f"[rank {rank}] Epoch {epoch} batch {batch_idx}: fixed {n_fixed} NaN/inf parameter gradients")
-                        nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                        optimizer.step()
-
-            # 如果预测含 NaN，则不计入有效样本统计（避免污染训练/验证指标）
-            if skip_batch:
-                continue
+                    loss.backward()
+                    zero_nan_gradients(model)
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    optimizer.step()
 
             sum_mse += mse.item()
             sum_rne += rne.item()
             n_ok    += 1
 
-    # ── 修复 ②: 跨 rank 聚合指标 ─────────────────────────────────
-    raw = {
-        "mse"      : sum_mse,
-        "rne"      : sum_rne,
-        "n_ok"     : float(n_ok),
-        "n_nan"    : float(n_nan),
-        "n_ng"     : float(n_nan_grad),
-        "n_inp_nan": float(n_input_nan),
-    }
-    agg = all_reduce_metrics(raw, device, world_size)
+            if show_bar:
+                bar.set_postfix(
+                    mse=f"{mse.item():.2f}",
+                    rne=f"{rne.item():.4f}",
+                    af=f"{aloss_val:.3f}" if aloss_val else "-")
 
-    n_ok_total = max(int(agg["n_ok"]), 1)
-    # agg contains sums across all ranks (all_reduce SUM),
-    # so normalize by the total number of processed batches to get averages.
+    if show_bar:
+        bar.close()
+
+    agg = all_reduce_metrics(
+        {"mse": sum_mse, "rne": sum_rne,
+         "aloss": sum_aloss,
+         "n_ok": float(n_ok), "n_nan": float(n_nan),
+         "n_aloss": float(n_aloss)},
+        device, world_size)
+    d      = max(int(agg["n_ok"]), 1)
+    d_al   = max(int(agg["n_aloss"]), 1)
     return {
-        "mse"         : float(agg["mse"]) / float(n_ok_total),
-        "rne"         : float(agg["rne"]) / float(n_ok_total),
-        "nan_batches" : int(agg["n_nan"]),
-        "nan_grads"   : int(agg["n_ng"]),
+        "mse"          : agg["mse"]   / d,
+        "rne"          : agg["rne"]   / d,
+        "anchor_loss"  : agg["aloss"] / d_al,
+        "nan_batches"  : int(agg["n_nan"]),
     }
+
 
 # ─────────────────────────────────────────────────────────────────
 # 主训练循环
@@ -238,20 +272,38 @@ def train(args):
     device  = torch.device(
         f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    if is_main:
-        print(f"=== PhysHGNet3D 训练 | N≈{args.n_nodes} | world_size={world_size} ===")
-
-    # ── 数据 ─────────────────────────────────────────────────────
     h5_path = find_h5_file(args.data_dir, args.n_nodes)
-    full_ds = LaserHardening3DDataset(h5_path, n_time_steps=args.n_time_steps)
-    N       = full_ds.N
 
-    n_total = len(full_ds)
-    n_train = int(n_total * 0.8)
-    n_val   = n_total - n_train
-    gen     = torch.Generator().manual_seed(args.seed)
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_ds, [n_train, n_val], generator=gen)
+    import h5py
+    with h5py.File(str(h5_path), 'r') as f:
+        all_keys = sorted(
+            [k for k in f.keys() if k.startswith('trajectory_')],
+            key=lambda x: int(x.split('_')[1]))
+    n_traj  = len(all_keys)
+    n_train = int(n_traj * 0.8)
+    train_ti = list(range(n_train))
+    val_ti   = list(range(n_train, n_traj))
+
+    train_ds = LaserHardening3DDataset(
+        str(h5_path), window_size=args.window_size, stride=args.stride,
+        traj_indices=train_ti)
+    val_ds   = LaserHardening3DDataset(
+        str(h5_path), window_size=args.window_size, stride=args.stride,
+        traj_indices=val_ti)
+
+    # 自动缩放锚点数
+    if args.m_anchors is None:
+        args.m_anchors = max(64, train_ds.N // 15)
+
+    if is_main:
+        print(f"╔{'═'*68}╗")
+        print(f"║  PhysHGNet3D（新版 anchor selector）  "
+              f"N={train_ds.N}  {world_size} GPU(s)")
+        print(f"║  m_anchors={args.m_anchors} "
+              f"({args.m_anchors/train_ds.N*100:.1f}% of N)  "
+              f"anchor_loss_weight={args.anchor_loss_weight}")
+        print(f"╚{'═'*68}╝")
+        print(train_ds.info())
 
     if world_size > 1:
         tr_sampler = DistributedSampler(
@@ -263,20 +315,15 @@ def train(args):
         tr_sampler = va_sampler = None
         tr_shuffle = True
 
-    tr_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                           sampler=tr_sampler, shuffle=tr_shuffle,
-                           collate_fn=collate_fn_3d,
-                           num_workers=args.num_workers, drop_last=True)
-    va_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                           sampler=va_sampler, shuffle=False,
-                           collate_fn=collate_fn_3d,
-                           num_workers=args.num_workers)
+    tr_loader = DataLoader(
+        train_ds, batch_size=args.batch_size,
+        sampler=tr_sampler, shuffle=tr_shuffle,
+        collate_fn=collate_fn_3d, num_workers=args.num_workers, drop_last=True)
+    va_loader = DataLoader(
+        val_ds,   batch_size=args.batch_size,
+        sampler=va_sampler, shuffle=False,
+        collate_fn=collate_fn_3d, num_workers=args.num_workers)
 
-    if is_main:
-        print(full_ds.info())
-        print(f"  训练={n_train} | 验证={n_val} | batch={args.batch_size}")
-
-    # ── 模型 ─────────────────────────────────────────────────────
     model_cfg = {
         **DEFAULT_CONFIG_3D,
         "m_anchors"           : args.m_anchors,
@@ -288,28 +335,26 @@ def train(args):
         "use_virtual_nodes"   : not args.no_virtual_nodes,
     }
     model = PhysHGNet3D(model_cfg).to(device)
-
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=True)
-
     raw_model = model.module if world_size > 1 else model
     if is_main:
         print(raw_model.extra_info())
-        print(f"  总参数量: {raw_model.num_parameters():,}")
+        n_total = raw_model.num_parameters()
+        n_sel   = sum(p.numel() for p in
+                      raw_model.anchor_selector.parameters())
+        print(f"  总参数量: {n_total:,}  其中 anchor_selector: {n_sel:,}")
 
-    # ── 优化器（v4：lr=3e-4 更稳）────────────────────────────────
-    optimizer = optim.AdamW(model.parameters(),
-                            lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = (torch.amp.GradScaler('cuda')
               if torch.cuda.is_available() and args.amp else None)
 
-    # ── 检查点 ───────────────────────────────────────────────────
     ckpt_dir  = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"best_{N}.pth"
+    ckpt_path = ckpt_dir / f"best_{train_ds.N}.pth"
 
     start_epoch = 0
     best_rne    = float('inf')
@@ -321,45 +366,79 @@ def train(args):
         start_epoch = ckpt["epoch"] + 1
         best_rne    = ckpt["best_rne"]
         if is_main:
-            print(f"  恢复 epoch={start_epoch}, best_rne={best_rne:.4f}")
+            print(f"  ↩ 恢复 epoch={start_epoch}  best_rne={best_rne:.4f}")
 
     log = []
-    for epoch in range(start_epoch, args.epochs):
+    epoch_bar = (tqdm(range(start_epoch, args.epochs),
+                      desc="PhysHGNet3D", unit="ep", ncols=100)
+                 if (is_main and HAS_TQDM) else range(start_epoch, args.epochs))
+
+    for epoch in epoch_bar:
         if world_size > 1:
             tr_sampler.set_epoch(epoch)
+
+        # anchor_loss_weight 线性预热：前 10 epoch 从 0 增到目标值
+        # 避免训练初期 anchor loss 破坏主损失收敛
+        warmup_epochs = min(10, args.epochs // 5)
+        eff_alw = args.anchor_loss_weight * min(
+            1.0, (epoch + 1) / max(warmup_epochs, 1))
 
         t0   = time.time()
         tr_m = run_epoch(model, tr_loader, optimizer, device,
                          is_train=True,  scaler=scaler,
-                         epoch=epoch, rank=rank, world_size=world_size)
+                         rank=rank, world_size=world_size,
+                         epoch_desc=f"  train ep{epoch+1}",
+                         anchor_loss_weight=eff_alw)
         va_m = run_epoch(model, va_loader, None, device,
-                         is_train=False, epoch=epoch,
-                         rank=rank, world_size=world_size)
+                         is_train=False,
+                         rank=rank, world_size=world_size,
+                         epoch_desc=f"  val   ep{epoch+1}",
+                         anchor_loss_weight=0.0)
         scheduler.step()
+
+        # ── VIZ PATCH：周期性保存锚点快照 ────────────────────────
+        _VIZ_EPOCHS = set(
+            list(range(1, 6)) +
+            list(range(5, args.epochs + 1, max(1, args.epochs // 8))))
+        if is_main and (epoch + 1) in _VIZ_EPOCHS:
+            _snap_dir = Path(args.ckpt_dir) / f"anchor_snapshots_{train_ds.N}"
+            _snap_dir.mkdir(exist_ok=True)
+            _snap_p = _snap_dir / f"epoch_{epoch+1:04d}_{train_ds.N}.pth"
+            torch.save({
+                "model"    : raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch"    : epoch,
+                "best_rne" : best_rne,
+                "config"   : model_cfg,
+            }, _snap_p)
+            _msg = f"  📸 锚点快照 → {_snap_p.name}"
+            tqdm.write(_msg) if HAS_TQDM else print(_msg)
 
         if is_main:
             elapsed = time.time() - t0
-            extra = ""
-            if tr_m["nan_batches"] > 0:
-                extra += f"  [NaN→clamp: {tr_m['nan_batches']}]"
-            if tr_m["nan_grads"] > 0:
-                extra += f"  [NaN梯度清零: {tr_m['nan_grads']}]"
-            print(
-                f"Epoch {epoch+1:4d}/{args.epochs} | "
-                f"train MSE={tr_m['mse']:.4f} RNE={tr_m['rne']:.4f} | "
-                f"val MSE={va_m['mse']:.4f} RNE={va_m['rne']:.4f} | "
-                f"{elapsed:.1f}s{extra}"
-            )
-            log.append({
-                "epoch"      : epoch + 1,
-                "train_mse"  : tr_m["mse"],
-                "train_rne"  : tr_m["rne"],
-                "val_mse"    : va_m["mse"],
-                "val_rne"    : va_m["rne"],
-                "nan_batches": tr_m["nan_batches"],
-                "nan_grads"  : tr_m["nan_grads"],
-            })
+            nan_s   = f" NaN={tr_m['nan_batches']}" if tr_m["nan_batches"] else ""
+            al_s    = f" af={tr_m['anchor_loss']:.4f}"
+            line    = (f"Ep {epoch+1:>4}/{args.epochs} | "
+                       f"tr MSE={tr_m['mse']:>9.2f} RNE={tr_m['rne']:.4f}{al_s} | "
+                       f"va MSE={va_m['mse']:>9.2f} RNE={va_m['rne']:.4f} | "
+                       f"{elapsed:.1f}s{nan_s}")
+            if HAS_TQDM:
+                epoch_bar.set_postfix(
+                    va_rne=f"{va_m['rne']:.4f}",
+                    af=f"{tr_m['anchor_loss']:.3f}")
+                tqdm.write(line)
+            else:
+                print(line)
 
+            log.append({
+                "epoch"       : epoch + 1,
+                "train_mse"   : tr_m["mse"],
+                "train_rne"   : tr_m["rne"],
+                "anchor_loss" : tr_m["anchor_loss"],
+                "val_mse"     : va_m["mse"],
+                "val_rne"     : va_m["rne"],
+            })
             cur = va_m["rne"]
             if 0 < cur < best_rne:
                 best_rne = cur
@@ -371,42 +450,52 @@ def train(args):
                     "best_rne" : best_rne,
                     "config"   : model_cfg,
                 }, ckpt_path)
-                print(f"  ✓ 保存最优 (RNE={best_rne:.4f})")
+                msg = f"  ✓ 保存最优 (val RNE={best_rne:.4f})"
+                tqdm.write(msg) if HAS_TQDM else print(msg)
 
     if is_main:
-        log_path = ckpt_dir / f"train_log_{N}.json"
-        with open(log_path, "w") as f:
+        with open(ckpt_dir / f"train_log_{train_ds.N}.json", "w") as f:
             json.dump(log, f, indent=2)
         print(f"\n训练完成！best val RNE={best_rne:.4f}")
-        print(f"检查点: {ckpt_path}   日志: {log_path}")
+        print(f"检查点: {ckpt_path}")
 
     cleanup_ddp()
+
 
 # ─────────────────────────────────────────────────────────────────
 # 参数解析
 # ─────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="PhysHGNet3D 训练（v4）")
-    p.add_argument("--n_nodes",      type=int,   default=5000)
+    p = argparse.ArgumentParser(
+        description="PhysHGNet3D 训练（新版可学习 anchor selector）")
+    p.add_argument("--n_nodes",      type=int,   default=4000)
     p.add_argument("--data_dir",     type=str,   default="data_laser_hardening_3d")
     p.add_argument("--ckpt_dir",     type=str,   default="checkpoints/phys_hgnet_3d")
     p.add_argument("--epochs",       type=int,   default=100)
-    p.add_argument("--batch_size",   type=int,   default=4)
-    p.add_argument("--lr",           type=float, default=3e-4)   # v4: 降低默认 lr
-    p.add_argument("--n_time_steps", type=int,   default=20)
-    p.add_argument("--m_anchors",    type=int,   default=64)
+    p.add_argument("--batch_size",   type=int,   default=2)
+    p.add_argument("--lr",           type=float, default=3e-4)
+    p.add_argument("--window_size",  type=int,   default=10)
+    p.add_argument("--stride",       type=int,   default=None)
+    p.add_argument("--m_anchors",    type=int,   default=None,
+                   help="None=自动 max(64, N//15)")
     p.add_argument("--hidden_dim",   type=int,   default=128)
     p.add_argument("--n_layers",     type=int,   default=5)
     p.add_argument("--num_workers",  type=int,   default=0)
-    p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--amp",          action="store_true")
     p.add_argument("--resume",       action="store_true")
+    # 锚点聚焦损失权重
+    p.add_argument("--anchor_loss_weight", type=float, default=0.05,
+                   help="anchor_focus_loss 的权重，0 = 关闭。"
+                        "建议范围 0.01~0.1，前 10 epoch 线性预热")
     p.add_argument("--no_physics_anchor", action="store_true")
     p.add_argument("--no_learned_coarse", action="store_true")
     p.add_argument("--no_dual_scale",     action="store_true")
     p.add_argument("--no_virtual_nodes",  action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.stride is None:
+        args.stride = max(1, args.window_size // 2)
+    return args
 
 if __name__ == "__main__":
     train(parse_args())

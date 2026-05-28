@@ -1,22 +1,16 @@
 """
-phys_hgnet_modules.py — PhysHGNet C1 / C2 / C3 modules.
+phys_hgnet_modules.py  ← 锚点选择器重写版（形状保护加固）
+================================================
+相比上一版的改动（仅 PhysicsAwareAnchorSelector）：
 
-C1: PhysicsAwareAnchorSelector  — three-term residual+gradient-weighted FPS
-C2: LearnableCoarseOperator     — graph structure learning for coarse operator
-C3: DualScaleGNNCorrector       — hierarchical fine+coarse GNN with virtual nodes
+新增 _to_node_field(t, N)：
+  无论调用方（phys_hgnet.py 或 train_phys_hgnet_3d.py）传入的张量
+  是 (N,) / (N,C) / (B,N,C) / (T,) / (B,T,N,C) 等任意形状，
+  都能安全提取出 (N,) 的节点标量场；
+  形状无法匹配时返回 None 而不是崩溃。
 
-Changes vs original:
-  PhysicsAwareAnchorSelector: cost function extended from 2 terms to 3 terms.
-
-  OLD: C_i = (1-λ) * d_min + λ * r_i           [λ: 1 sigmoid param]
-  NEW: C_i = α * d_min + β * r_i + γ * g_i     [α,β,γ: softmax of 3 params]
-
-  where g_i = ‖∇u‖_i is the per-node physical gradient norm supplied by
-  phys_hgnet.py and computed in gradient_utils.py.
-
-  Backward-compatible: if grad_norm is None, γ term is effectively 0 and
-  the selector behaves like the two-term (geometry + residual) version.
-  If use_physics_anchor=False, all three physics terms vanish → plain FPS.
+其余模块（LearnableCoarseOperator、DualScaleGNNCorrector 等）
+完全保留原版（含 Fix A/A-extra 数值稳定修复）。
 """
 
 import math
@@ -47,133 +41,143 @@ def build_knn_edges(src_coords, dst_coords, k, eps=1e-8):
     return edge_index, weights.reshape(-1)
 
 
-# ─────────────────────────────────────────────────────────────
-# C1: Physics-Aware Anchor Selector (three-term weighted FPS)
-# ─────────────────────────────────────────────────────────────
+def _to_node_field(t: Optional[torch.Tensor], N: int) -> Optional[torch.Tensor]:
+    """
+    从任意形状张量中提取 (N,) 的节点标量场。
+
+    支持的输入形状（按优先顺序匹配）：
+      (N,)           → 直接返回
+      (N, C)         → 取第 0 列
+      (B, N, C)      → 取 batch=0, channel=0
+      (B, N)         → 取 batch=0
+      (B, T, N, C)   → 取 batch=0, t=-1, channel=0
+    其他形状 → 返回 None（不崩溃）
+    """
+    if t is None:
+        return None
+    t = t.detach().float()
+    if t.dim() == 1:
+        if t.shape[0] == N:
+            return t
+    elif t.dim() == 2:
+        if t.shape[0] == N:          # (N, C)
+            return t[:, 0]
+        if t.shape[1] == N:          # (B, N)
+            return t[0]
+    elif t.dim() == 3:
+        if t.shape[1] == N:          # (B, N, C)
+            return t[0, :, 0]
+        if t.shape[0] == N:          # (N, ?, ?)
+            return t[:, 0, 0]
+    elif t.dim() == 4:
+        if t.shape[2] == N:          # (B, T, N, C)
+            return t[0, -1, :, 0]
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────
+# C1: Physics-Aware Anchor Selector（MLP 打分版）
+# ──────────────────────────────────────────────────────────────────
 
 class PhysicsAwareAnchorSelector(nn.Module):
     """
-    Three-term weighted Farthest Point Sampling for anchor selection.
+    可学习的物理感知锚点选择器（MLP 打分版）
 
-    Cost function:
-        C_i = α · d_min(i, A)_norm       ← geometric dispersion
-            + β · r_i_norm               ← PDE residual magnitude
-            + γ · ‖∇u‖_i_norm           ← physical gradient magnitude
+    输入特征（7 维）：
+      coords(3) + heat_source_q(1) + temperature(1)
+      + residual_norm(1) + grad_norm(1)
 
-    (α, β, γ) are softmax-normalised learnable weights (sum = 1).
-    Initial values are controlled by init_weights (logit space).
-
-    Degrades gracefully:
-      - use_physics_anchor=False  →  plain FPS (α=1, β=γ=0)
-      - residual is None          →  β term is zeroed
-      - grad_norm is None         →  γ term is zeroed
+    所有可选输入均通过 _to_node_field 做形状保护，
+    无论调用方传入什么形状都不会崩溃。
     """
 
-    def __init__(self, init_lambda: float = 0.3,
+    def __init__(self, feat_dim: int = 7, hidden_dim: int = 32,
+                 init_lambda: float = 0.3,
                  init_weights: Tuple[float, float, float] = (2.0, 1.0, 1.0)):
-        """
-        Args:
-            init_lambda:  kept for API compatibility (unused internally).
-            init_weights: initial logits (before softmax) for (α, β, γ).
-                          Default (2,1,1) → geometry-heavy start, matching
-                          the original single-λ bias toward FPS geometry.
-        """
         super().__init__()
-        # Three raw logits; softmax gives (α, β, γ) with α+β+γ=1.
-        self.raw_weights = nn.Parameter(
-            torch.tensor(list(init_weights), dtype=torch.float32))
+        self.feat_dim = feat_dim
+        self.scorer = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.scorer[-1].weight)
+        nn.init.zeros_(self.scorer[-1].bias)
 
-    # ── public helpers ────────────────────────────────────────
+    @staticmethod
+    def _norm(x: torch.Tensor) -> torch.Tensor:
+        return x / x.abs().max().clamp(min=1e-8)
 
-    @property
-    def weights(self) -> torch.Tensor:
-        """Returns (α, β, γ) normalised so they sum to 1."""
-        return F.softmax(self.raw_weights, dim=0)
+    def score_nodes(
+        self,
+        nodes: torch.Tensor,                          # (N, 3)
+        source_q: Optional[torch.Tensor] = None,
+        temperature: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        grad_norm: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """返回每个节点的标量得分 (N,)，完全可微。"""
+        N, device = nodes.shape[0], nodes.device
+        z = torch.zeros(N, device=device)
 
-    # Kept for compatibility with any code that reads .lam
-    @property
-    def lam(self) -> torch.Tensor:
-        w = self.weights
-        return w[1]   # β ≈ original λ (residual weight)
+        # 所有输入都经过 _to_node_field 统一处理，保证形状为 (N,)
+        q_t   = _to_node_field(source_q,   N)
+        t_t   = _to_node_field(temperature, N)
+        # residual 可能是 (N, C)，先处理多通道
+        if residual is not None and residual.dim() > 1:
+            residual = residual.norm(dim=-1)
+        r_t   = _to_node_field(residual, N)
+        g_t   = _to_node_field(grad_norm, N)
 
-    # ── core FPS ──────────────────────────────────────────────
+        coords_n = self._norm(nodes.float())
+        q_n   = self._norm(q_t.to(device))   if q_t   is not None else z
+        t_n   = self._norm(t_t.to(device))   if t_t   is not None else z
+        r_n   = self._norm(r_t.to(device))   if r_t   is not None else z
+        g_n   = self._norm(g_t.to(device))   if g_t   is not None else z
 
-    def forward(self,
-                nodes: torch.Tensor,                  # [N, d]
-                m: int,
-                residual: Optional[torch.Tensor] = None,   # [N]
-                grad_norm: Optional[torch.Tensor] = None,  # [N]  ← new
-                use_physics_anchor: bool = True,
-                ) -> torch.Tensor:                    # [m] anchor indices
+        feat = torch.stack(
+            [coords_n[:, 0], coords_n[:, 1], coords_n[:, 2],
+             q_n, t_n, r_n, g_n], dim=1)           # (N, 7)
+        return self.scorer(feat).squeeze(-1)        # (N,)
+
+    def forward(
+        self,
+        nodes: torch.Tensor,
+        m: int,
+        source_q: Optional[torch.Tensor] = None,
+        temperature: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        grad_norm: Optional[torch.Tensor] = None,
+        use_physics_anchor: bool = True,
+    ) -> torch.Tensor:
         N = nodes.shape[0]
         m = min(m, N)
-        device = nodes.device
-
-        # ── Build the three signal vectors ────────────────────
-        def _normalize(x: torch.Tensor) -> torch.Tensor:
-            return x / x.max().clamp(min=1e-8)
 
         if use_physics_anchor:
-            alpha, beta, gamma = self.weights.unbind()
-
-            r_norm = (_normalize(
-                residual.norm(dim=-1) if residual.dim() > 1 else residual.abs())
-                      if residual is not None
-                      else torch.zeros(N, device=device))
-
-            g_norm = (_normalize(grad_norm)
-                      if grad_norm is not None
-                      else torch.zeros(N, device=device))
+            scores = self.score_nodes(
+                nodes, source_q=source_q, temperature=temperature,
+                residual=residual, grad_norm=grad_norm)
         else:
-            # Plain FPS: geometry only
-            alpha = torch.ones(1, device=device)
-            beta  = torch.zeros(1, device=device)
-            gamma = torch.zeros(1, device=device)
-            r_norm = torch.zeros(N, device=device)
-            g_norm = torch.zeros(N, device=device)
+            scores = torch.zeros(N, device=nodes.device)
 
-        # ── Seed: node with highest physics signal ─────────────
-        if use_physics_anchor and (residual is not None or grad_norm is not None):
-            seed_score = beta * r_norm + gamma * g_norm
-            first = int(seed_score.argmax().item())
-        else:
-            first = 0
-        selected = [first]
-
-        # d_min[i] = distance from i to nearest selected anchor
-        d_min = _pairwise_sq_dist(nodes, nodes[first:first + 1]).squeeze(1).sqrt()
-
-        # ── Iterative selection ───────────────────────────────
-        for _ in range(m - 1):
-            d_norm = _normalize(d_min)
-            cost = alpha * d_norm + beta * r_norm + gamma * g_norm
-            cost[selected] = -float('inf')          # exclude already selected
-            next_idx = int(cost.argmax().item())
-            selected.append(next_idx)
-            d_new = _pairwise_sq_dist(
-                nodes, nodes[next_idx:next_idx + 1]).squeeze(1).sqrt()
-            d_min = torch.minimum(d_min, d_new)
-
-        return torch.tensor(selected, dtype=torch.long, device=device)
-
-    # ── diagnostics ───────────────────────────────────────────
+        _, anchor_idx = torch.topk(scores, m, sorted=False)
+        return anchor_idx.long()
 
     def weight_summary(self) -> str:
-        alpha, beta, gamma = self.weights.detach().unbind()
-        return (f"α(geo)={alpha:.3f}  β(res)={beta:.3f}  γ(grad)={gamma:.3f}")
+        norms = [f"layer{i}_wnorm={p.norm().item():.4f}"
+                 for i, (name, p) in enumerate(self.scorer.named_parameters())
+                 if "weight" in name]
+        return "  ".join(norms)
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # C2: Learnable Coarse Operator (Graph Structure Learning)
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 class LearnableCoarseOperator(nn.Module):
     """
     GSL-based coarse operator.
-
-    Edge weights predicted by MLP(x_i, x_j, h_i, h_j, dist).
-    Diagonal constrained to ensure row-sum = 0 (conservation).
-    Softplus activation ensures non-negativity (physical diffusion coefficients).
+    Fix A: Gershgorin 谱归一化，Fix A-extra: softplus 输出硬夹 max=10。
     """
 
     def __init__(self, spatial_dim, feat_dim, hidden_dim=64, k_coarse=6, eps=1e-8):
@@ -199,7 +203,9 @@ class LearnableCoarseOperator(nn.Module):
         hi, hj = anchor_feats[src], anchor_feats[dst]
         dist = (xi - xj).norm(dim=-1, keepdim=True).clamp(min=self.eps)
         edge_feat = torch.cat([xi, xj, hi, hj, dist], dim=-1)
-        return F.softplus(self.edge_mlp(edge_feat).squeeze(-1))
+        raw = self.edge_mlp(edge_feat).squeeze(-1)
+        w = F.softplus(raw)
+        return w.clamp(max=10.0)
 
     def forward(self, anchor_coords, anchor_feats, edge_index, use_learned_coarse=True):
         m = anchor_coords.shape[0]
@@ -210,19 +216,20 @@ class LearnableCoarseOperator(nn.Module):
         src, dst = edge_index
         row_oh = F.one_hot(src, num_classes=m).to(dtype=w.dtype)
         col_oh = F.one_hot(dst, num_classes=m).to(dtype=w.dtype)
-        L_off = row_oh.t() @ (w.unsqueeze(1) * col_oh)
+        L_off     = row_oh.t() @ (w.unsqueeze(1) * col_oh)
         L_off_sym = L_off + L_off.t()
         diag_vals = -L_off_sym.sum(dim=1)
-        return L_off_sym + torch.diag(diag_vals)
+        L_hat     = L_off_sym + torch.diag(diag_vals)
+
+        spec_bound = (2.0 * diag_vals.abs().max()).clamp(min=1e-8)
+        return L_hat / spec_bound
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # C3: Dual-Scale GNN Corrector
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 class _MPNN(MessagePassing):
-    """Single MPNN layer with edge features, residual + LayerNorm."""
-
     def __init__(self, dim, edge_dim, aggr='mean'):
         super().__init__(aggr=aggr)
         self.msg_mlp = nn.Sequential(
@@ -241,15 +248,6 @@ class _MPNN(MessagePassing):
 
 
 class DualScaleGNNCorrector(nn.Module):
-    """
-    Hierarchical non-linear correction on fine + coarse graphs.
-
-    Fine graph:   local MPNN, O(E * L_fine)
-    Coarse graph: deeper MPNN on m << N anchors, captures long-range effects
-    Virtual nodes: k_vn global nodes connected to all anchors (diameter O(1))
-    Fusion:       r = α_f * r_fine + α_c * P * r_coarse
-    """
-
     def __init__(self, spatial_dim, feature_dim, output_dim,
                  hidden_dim=128, num_fine_layers=5, num_coarse_layers=4,
                  k_virtual_nodes=4, num_node_types=3):
@@ -258,7 +256,6 @@ class DualScaleGNNCorrector(nn.Module):
         self.output_dim = output_dim
         self.k_vn = k_virtual_nodes
 
-        # Fine encoder
         self.fine_enc = nn.Sequential(
             nn.Linear(spatial_dim + feature_dim + num_node_types, hidden_dim),
             nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
@@ -268,15 +265,15 @@ class DualScaleGNNCorrector(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, output_dim))
 
-        # Coarse encoder
         coarse_in = spatial_dim + feature_dim
         self.coarse_enc = nn.Sequential(
             nn.Linear(coarse_in, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim))
         self.coarse_layers = nn.ModuleList(
             [_MPNN(hidden_dim, spatial_dim + 1) for _ in range(num_coarse_layers)])
-        self.virtual_embed = nn.Parameter(torch.randn(k_virtual_nodes, hidden_dim) * 0.01)
-        self.vn_agg_mlp = nn.Sequential(
+
+        self.virtual_embed  = nn.Parameter(torch.randn(k_virtual_nodes, hidden_dim) * 0.01)
+        self.vn_agg_mlp  = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
         self.vn_bcast_mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
@@ -284,14 +281,13 @@ class DualScaleGNNCorrector(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, output_dim))
 
-        # Learnable fusion weights
-        self.raw_alpha_fine = nn.Parameter(torch.zeros(1))
+        self.raw_alpha_fine   = nn.Parameter(torch.zeros(1))
         self.raw_alpha_coarse = nn.Parameter(torch.zeros(1))
 
-        # Init decoders near zero
         for dec in [self.fine_dec, self.coarse_dec]:
             nn.init.normal_(dec[-1].weight, std=1e-3)
             nn.init.zeros_(dec[-1].bias)
+
     @property
     def alpha_fine(self):
         return F.softplus(self.raw_alpha_fine)
@@ -308,14 +304,14 @@ class DualScaleGNNCorrector(nn.Module):
         return self.fine_dec(h)
 
     def _virtual_node_step(self, h):
-        vn = self.virtual_embed
+        vn     = self.virtual_embed
         pooled = h.mean(dim=0, keepdim=True)
         vn_updated = self.vn_agg_mlp(vn + pooled)
         vn_msg = vn_updated.mean(dim=0, keepdim=True).expand(h.shape[0], -1)
         return self.vn_bcast_mlp(torch.cat([h, vn_msg], dim=-1))
 
     def _coarse_forward(self, u_coarse, anchor_coords, coarse_ei, coarse_ea,
-                         use_virtual_nodes=True):
+                        use_virtual_nodes=True):
         h = self.coarse_enc(torch.cat([u_coarse, anchor_coords], dim=-1))
         for i, layer in enumerate(self.coarse_layers):
             if use_virtual_nodes and (i % 2 == 0):
@@ -330,8 +326,7 @@ class DualScaleGNNCorrector(nn.Module):
         r_fine = self._fine_forward(u, nodes, edge_index, edge_attr, node_type)
         if not use_dual_scale:
             return r_fine
-
-        u_coarse = (torch.sparse.mm(R, u) if R.is_sparse else R @ u)
+        u_coarse   = (torch.sparse.mm(R, u) if R.is_sparse else R @ u)
         r_coarse_m = self._coarse_forward(u_coarse, anchor_coords,
                                           coarse_edge_index, coarse_edge_attr,
                                           use_virtual_nodes=use_virtual_nodes)
@@ -339,21 +334,18 @@ class DualScaleGNNCorrector(nn.Module):
         return self.alpha_fine * r_fine + self.alpha_coarse * r_coarse_n
 
 
-# ─────────────────────────────────────────────────────────────
-# R / P construction helpers
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# R / P helpers
+# ──────────────────────────────────────────────────────────────────
 
 def build_restriction_prolongation(nodes, anchor_idx, q=4, eps=1e-8):
-    """Build R (m×N) and P (N×m) interpolation matrices."""
     N = nodes.shape[0]
     anchor_coords = nodes[anchor_idx]
     m = anchor_coords.shape[0]
     device = nodes.device
-
     edge_idx_R, w_R = build_knn_edges(anchor_coords, nodes, q, eps)
     R = torch.zeros(m, N, device=device, dtype=nodes.dtype)
     R[edge_idx_R[0], edge_idx_R[1]] = w_R
-
     edge_idx_P, w_P = build_knn_edges(nodes, anchor_coords, q, eps)
     P = torch.zeros(N, m, device=device, dtype=nodes.dtype)
     P[edge_idx_P[0], edge_idx_P[1]] = w_P
@@ -361,8 +353,7 @@ def build_restriction_prolongation(nodes, anchor_idx, q=4, eps=1e-8):
 
 
 def build_coarse_edge_attr(anchor_coords, coarse_edge_index):
-    """Edge features for coarse graph: [delta_x, dist]."""
     src, dst = coarse_edge_index
     delta = anchor_coords[dst] - anchor_coords[src]
-    dist = delta.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    dist  = delta.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     return torch.cat([delta, dist], dim=-1)

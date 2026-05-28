@@ -202,7 +202,7 @@ def build_operator_3d(
     w = DIFF_COEFF * kvals / M_diag[rows]
 
     ei = torch.tensor(np.stack([rows, cols], axis=0), dtype=torch.long,  device=device)
-    ew = torch.tensor(w,                              dtype=torch.float32, device=device)
+    ew = torch.tensor(w,                              dtype=torch.float32, device=device).clamp(min=0.0)
     nv = torch.tensor(nv_np,                          dtype=torch.float32, device=device)
 
     return {

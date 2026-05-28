@@ -1,37 +1,31 @@
 """
-dataset_3d.py — PhysHGNet 3D 数据集加载器
-==========================================
+dataset_3d.py — PhysHGNet 3D 数据集加载器（滑动窗口版）
+=========================================================
 
-加载 generate_laser_data_3d.py 生成的 HDF5 文件，
-返回与 PhysHGNet3D.forward 期望接口兼容的 batch 字典。
+核心改动：按照 DGNet 仓库的正确实现思路，
+对每条长轨迹（T 步）做滑动窗口切分，
+每个窗口作为一个独立训练样本。
 
-主要与 2D dataset.py 的差异
----------------------------
-1. nodes 形状 (N, 3)，spatial_dim = 3
-2. tets 键：(F, 4) 四面体连接（取代 faces (F,3) 三角面）
-3. node_volumes：直接从 HDF5 读取（generate 时已保存）
-4. L_physics：从 HDF5 预存的稀疏 Laplacian 读取，避免每次重建
-5. edges 基于四面体提取的无向边
-
-HDF5 文件结构（generate_laser_data_3d.py 输出）
--------------------------------------------------
+HDF5 结构
+---------
 /mesh_meta/
-    nodes        (N, 3)  float32
-    edges        (E, 2)  int32
-    faces        (BF,3)  int32   边界三角面
-    tets         (F, 4)  int32
-    node_volumes (N,)    float32
-    L_physics_ei (2,2E') int64    稀疏 Laplacian 边索引
-    L_physics_ew (2E',)  float32  稀疏 Laplacian 边权重
-    time_points  (T,)    float32
+    nodes (N,3)  edges (E,2)  faces (BF,3)  tets (F,4)
+    node_volumes (N,)  L_physics_ei (2,2E')  L_physics_ew (2E',)
+    time_points (T,)
 /trajectory_{i}/
-    node_features     (T, N, 1) float32
-    source_terms      (T, N, 1) float32
-    initial_condition (1, N, 1) float32
-    boundary_info/
-        dirichlet/
-            indices  int32
-            values   float32
+    node_features  (T, N, 1)
+    source_terms   (T, N, 1)
+    initial_condition (1, N, 1)
+
+样本数量估算（以 n_traj=40, T=61, win=10, stride=5 为例）
+-------------------------------------------------------
+  每条轨迹窗口数 = floor((61 - 10) / 5) + 1 = 11
+  总训练样本    = 40 × 11 = 440 个
+
+参数说明
+--------
+window_size  : 每个子轨迹包含的时步数（含初始条件，即 T_sub = window_size）
+stride       : 相邻窗口的起始步间隔（stride < window_size 时窗口有重叠）
 """
 
 from __future__ import annotations
@@ -45,55 +39,63 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # ─────────────────────────────────────────────────────────────────
-# 辅助：路径解析
+# 路径工具
 # ─────────────────────────────────────────────────────────────────
 
 def find_h5_file(data_dir: str, n_nodes: int) -> Path:
-    """在 data_dir 中寻找匹配 N 的 HDF5 文件。"""
     data_dir_ = Path(data_dir)
-    # 优先精确匹配
     for pattern in [f"pde_trajectories_3d_N{n_nodes}.h5",
-                    f"pde_trajectories_3d_N*.h5"]:
+                    "pde_trajectories_3d_N*.h5"]:
         matches = sorted(data_dir_.glob(pattern))
         if matches:
             return matches[0]
     raise FileNotFoundError(
         f"在 {data_dir} 中找不到 N≈{n_nodes} 的 3D HDF5 文件。"
-        f"请先运行 generate_laser_data_3d.py --n_nodes {n_nodes}"
+        f"\n请先运行：python generate_laser_data_3d.py --n_nodes {n_nodes}"
     )
 
 
 # ─────────────────────────────────────────────────────────────────
-# 主数据集类
+# 主数据集类（滑动窗口）
 # ─────────────────────────────────────────────────────────────────
 
 class LaserHardening3DDataset(Dataset):
-    """3D 激光淬火 PDE 轨迹数据集。
+    """3D 激光淬火 PDE 数据集，使用滑动窗口切分长轨迹。
+
+    核心设计
+    --------
+    - 每条长轨迹（T 步）被切分为若干长度为 window_size 的短窗口。
+    - 每个窗口 (traj_idx, start_t) 是一个独立的训练样本：
+        initial_conditions = u[start_t]
+        source_terms       = src[start_t : start_t + window_size]
+        targets            = u[start_t : start_t + window_size]
+    - 窗口间距由 stride 控制；stride < window_size 时窗口有重叠，
+      data augmentation 效果更佳。
 
     参数
     ----
-    h5_path      : HDF5 文件路径
-    n_time_steps : 每个样本使用的时间步数（从第 0 步起）
-    device       : 张量设备（通常 'cpu'，DataLoader 后再转 GPU）
-    traj_indices : 指定使用哪些轨迹（None = 全部）
+    h5_path     : HDF5 文件路径
+    window_size : 子轨迹时步数（模型 forward 中的 T）
+    stride      : 相邻窗口起点间隔，默认 = window_size//2（50% 重叠）
+    traj_indices: 指定使用哪些轨迹（None=全部）
     """
 
     def __init__(
         self,
         h5_path:      str,
-        n_time_steps: int = 20,
-        device:       str = 'cpu',
+        window_size:  int  = 10,
+        stride:       Optional[int] = None,
         traj_indices: Optional[List[int]] = None,
     ):
         super().__init__()
-        self.h5_path      = Path(h5_path)
-        self.n_time_steps = n_time_steps
-        self.device       = device
+        self.h5_path     = Path(h5_path)
+        self.window_size = window_size
+        # 默认 stride = window_size // 2（50% 重叠，样本数翻倍）
+        self.stride      = stride if stride is not None else max(1, window_size // 2)
 
-        # ── 读取全局网格元数据 ─────────────────────────────────
+        # ── 读取全局网格元数据 ─────────────────────────────────────
         with h5py.File(self.h5_path, 'r') as f:
             meta = f['mesh_meta']
-
             self.nodes        = torch.tensor(meta['nodes'][:],        dtype=torch.float32)
             self.edges        = torch.tensor(meta['edges'][:],        dtype=torch.long)
             self.faces        = torch.tensor(meta['faces'][:],        dtype=torch.long)
@@ -101,9 +103,9 @@ class LaserHardening3DDataset(Dataset):
             self.node_volumes = torch.tensor(meta['node_volumes'][:], dtype=torch.float32)
             self.time_points  = torch.tensor(meta['time_points'][:],  dtype=torch.float32)
 
-            # 稀疏 Laplacian（预存，避免每次重建 FEM）
+            # 预存稀疏 Laplacian
             L_ei = torch.tensor(meta['L_physics_ei'][:], dtype=torch.long)
-            L_ew = torch.tensor(meta['L_physics_ew'][:], dtype=torch.float32)
+            L_ew = torch.tensor(meta['L_physics_ew'][:], dtype=torch.float32).clamp(min=0.0)  # 负 FEM 权重（钝角单元）强制为 0
             self.L_physics = {
                 "type"         : "sparse",
                 "edge_index"   : L_ei,
@@ -111,115 +113,129 @@ class LaserHardening3DDataset(Dataset):
                 "node_volumes" : self.node_volumes,
             }
 
-            # 节点类型（0=内部, 1=边界）
-            N = self.nodes.shape[0]
-            bnd_set = set(self.faces.numpy().ravel().tolist()) if len(self.faces) > 0 else set()
-            nt = torch.zeros(N, dtype=torch.long)
-            if bnd_set:
-                nt[list(bnd_set)] = 1
+            # 节点类型（0=内部，1=边界）
+            N    = self.nodes.shape[0]
+            bset = set(self.faces.numpy().ravel().tolist()) if len(self.faces) > 0 else set()
+            nt   = torch.zeros(N, dtype=torch.long)
+            if bset:
+                nt[list(bset)] = 1
             self.node_type = nt
 
-            # 轨迹列表
-            all_traj_keys = sorted([k for k in f.keys() if k.startswith('trajectory_')],
-                                    key=lambda x: int(x.split('_')[1]))
+            # 完整轨迹键列表
+            all_keys = sorted(
+                [k for k in f.keys() if k.startswith('trajectory_')],
+                key=lambda x: int(x.split('_')[1]))
             self.traj_keys = (
-                [all_traj_keys[i] for i in traj_indices] if traj_indices is not None
-                else all_traj_keys
+                [all_keys[i] for i in traj_indices]
+                if traj_indices is not None else all_keys
             )
+            T_total = len(self.time_points)
 
-        self.N = self.nodes.shape[0]
-        T_avail = len(self.time_points)
-        self.n_time_steps = min(n_time_steps, T_avail)
+        self.N       = self.nodes.shape[0]
+        self.T_total = T_total
 
-    # ── 统计信息 ──────────────────────────────────────────────────
+        # ── 构建 (轨迹索引, 起始步) 的所有窗口列表 ─────────────────
+        self._windows: List[Tuple[int, int]] = []
+        for ti in range(len(self.traj_keys)):
+            t = 0
+            while t + self.window_size <= self.T_total:
+                self._windows.append((ti, t))
+                t += self.stride
+        # 如果没有任何合法窗口（轨迹太短），回退到单窗口
+        if not self._windows:
+            ws = min(self.window_size, self.T_total)
+            for ti in range(len(self.traj_keys)):
+                self._windows.append((ti, 0))
+            self.window_size = ws
+
+    # ── 统计 ─────────────────────────────────────────────────────
+
     def __len__(self) -> int:
-        return len(self.traj_keys)
+        return len(self._windows)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        key = self.traj_keys[idx]
-        T   = self.n_time_steps
+        traj_idx, start_t = self._windows[idx]
+        key = self.traj_keys[traj_idx]
+        ws  = self.window_size
+        end_t = start_t + ws
 
         with h5py.File(self.h5_path, 'r') as f:
-            g    = f[key]
-            u    = torch.tensor(g['node_features'][:T],     dtype=torch.float32)   # (T, N, 1)
-            src  = torch.tensor(g['source_terms'][:T],      dtype=torch.float32)   # (T, N, 1)
-            u0   = torch.tensor(g['initial_condition'][:1], dtype=torch.float32)   # (1, N, 1)
-
-            # Dirichlet BC
-            bnd_g = g['boundary_info']['dirichlet']
+            g   = f[key]
+            # 切取当前窗口
+            u   = torch.tensor(g['node_features'][start_t:end_t], dtype=torch.float32)  # (ws,N,1)
+            src = torch.tensor(g['source_terms'][start_t:end_t],  dtype=torch.float32)  # (ws,N,1)
+            # 窗口的 BC 与全局一致（不随时间变化）
+            bnd_g   = g['boundary_info']['dirichlet']
             bnd_idx = torch.tensor(bnd_g['indices'][:], dtype=torch.long)
             bnd_val = torch.tensor(bnd_g['values'][:],  dtype=torch.float32)
 
-        batch = {
-            # 网格（每个样本均相同，但 DataLoader 需要）
-            "nodes"             : self.nodes,             # (N, 3)
-            "edges"             : self.edges,             # (E, 2)
-            "faces"             : self.faces,             # (BF, 3)
-            "tets"              : self.tets,              # (F, 4)
-            "node_volumes"      : self.node_volumes,      # (N,)
-            "node_type"         : self.node_type,         # (N,)
-            # 物理算子（稀疏 Laplacian）
+        # 本窗口对应的时间坐标
+        tp_window = self.time_points[start_t:end_t]
+
+        return {
+            # 网格（所有窗口共享）
+            "nodes"             : self.nodes,
+            "edges"             : self.edges,
+            "faces"             : self.faces,
+            "tets"              : self.tets,
+            "node_volumes"      : self.node_volumes,
+            "node_type"         : self.node_type,
             "L_physics"         : self.L_physics,
-            # 轨迹数据
-            "initial_conditions": u[0:1].squeeze(0),      # (N, 1)
-            "source_terms"      : src.unsqueeze(0),       # (1, T, N, 1)  → batch 维度由 collate 处理
-            "time_points"       : self.time_points[:T],   # (T,)
-            "targets"           : u,                      # (T, N, 1)
-            # 边界
-            "boundary_info"     : {
+            # 本窗口数据
+            "initial_conditions": u[0],            # (N, 1) — 窗口第 0 步
+            "source_terms"      : src,             # (ws, N, 1)
+            "time_points"       : tp_window,       # (ws,)
+            "targets"           : u,               # (ws, N, 1) — 监督目标
+            # BC
+            "boundary_info": {
                 "dirichlet": {"indices": bnd_idx, "values": bnd_val}
             },
-            # 用于调试：返回轨迹键，以便训练时定位出问题的样本
-            "traj_key"          : key,
         }
-        return batch
 
     def info(self) -> str:
+        n_windows_per_traj = len(self._windows) / max(len(self.traj_keys), 1)
         return (
             f"LaserHardening3DDataset | 文件: {self.h5_path.name}\n"
             f"  节点 N={self.N} | 四面体={len(self.tets)} | 边={len(self.edges)}\n"
-            f"  轨迹数={len(self.traj_keys)} | 时间步={self.n_time_steps}\n"
-            f"  空间维度=3 | 特征维度=1"
+            f"  轨迹数={len(self.traj_keys)} | T_total={self.T_total}\n"
+            f"  window_size={self.window_size} | stride={self.stride}\n"
+            f"  每条轨迹窗口数≈{n_windows_per_traj:.1f}\n"
+            f"  总样本数={len(self._windows)}"
         )
 
 
 # ─────────────────────────────────────────────────────────────────
-# Collate：将 list[dict] 整理成 batch dict
+# Collate（将 list[dict] → batch dict）
 # ─────────────────────────────────────────────────────────────────
 
 def collate_fn_3d(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """将多个样本的轨迹数据组合成 batch。
+    """将多个窗口样本整合为 batch。
 
-    网格数据（nodes/edges/tets/...）在同一文件内完全相同，
-    直接取第一个样本的值即可（不做 stack）。
+    网格数据（nodes/edges/tets/...）来自同一 HDF5，各样本完全相同，
+    直接取第一个样本即可（不做 stack）。
 
-    轨迹数据（source_terms/targets/initial_conditions）沿 batch 维度 stack。
+    轨迹数据沿 batch 维度 stack：
+        initial_conditions : (B, N, 1)
+        source_terms       : (B, ws, N, 1)
+        targets            : (B, ws, N, 1)
     """
-    B = len(samples)
     s0 = samples[0]
-
-    batch = {
+    return {
         # 网格（共享）
-        "nodes"       : s0["nodes"],
-        "edges"       : s0["edges"],
-        "faces"       : s0["faces"],
-        "tets"        : s0["tets"],
-        "node_volumes": s0["node_volumes"],
-        "node_type"   : s0["node_type"],
-        "L_physics"   : s0["L_physics"],
-        "time_points" : s0["time_points"],
+        "nodes"        : s0["nodes"],
+        "edges"        : s0["edges"],
+        "faces"        : s0["faces"],
+        "tets"         : s0["tets"],
+        "node_volumes" : s0["node_volumes"],
+        "node_type"    : s0["node_type"],
+        "L_physics"    : s0["L_physics"],
+        "time_points"  : s0["time_points"],
         "boundary_info": s0["boundary_info"],
-        # 轨迹（stack 成 batch）
-        # initial_conditions: (B, N, 1)
+        # 轨迹（batch 维度）
         "initial_conditions": torch.stack([s["initial_conditions"] for s in samples], dim=0),
-        # source_terms: (B, T, N, 1)
-        "source_terms": torch.stack([s["source_terms"].squeeze(0) for s in samples], dim=0),
-        # targets: (B, T, N, 1)
-        "targets"     : torch.stack([s["targets"] for s in samples], dim=0),
-        # 轨迹键列表（用于调试）
-        "traj_keys"   : [s["traj_key"] for s in samples],
+        "source_terms"      : torch.stack([s["source_terms"]       for s in samples], dim=0),
+        "targets"           : torch.stack([s["targets"]            for s in samples], dim=0),
     }
-    return batch
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -227,85 +243,93 @@ def collate_fn_3d(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────
 
 def build_dataloaders_3d(
-    data_dir:       str,
-    n_nodes:        int,
-    batch_size:     int   = 4,
-    n_time_steps:   int   = 20,
-    train_ratio:    float = 0.8,
-    num_workers:    int   = 0,
-    seed:           int   = 42,
+    data_dir:    str,
+    n_nodes:     int,
+    batch_size:  int   = 4,
+    window_size: int   = 10,
+    stride:      Optional[int] = None,
+    train_ratio: float = 0.8,
+    num_workers: int   = 0,
+    seed:        int   = 42,
 ) -> Tuple[DataLoader, DataLoader]:
-    """构建 3D 训练集 / 验证集 DataLoader。
+    """构建 3D 训练 / 验证 DataLoader。
 
-    返回
-    ----
-    train_loader, val_loader
+    注意：按轨迹切分 train/val，避免同一轨迹的不同窗口同时出现在
+    两个 split 中导致数据泄露。
     """
-    h5_path = find_h5_file(data_dir, n_nodes)
-    ds_full = LaserHardening3DDataset(h5_path, n_time_steps=n_time_steps)
+    h5_path  = find_h5_file(data_dir, n_nodes)
 
-    n_total = len(ds_full)
-    n_train = int(n_total * train_ratio)
-    n_val   = n_total - n_train
+    # 先统计轨迹总数，再按轨迹编号切分
+    with h5py.File(str(h5_path), 'r') as f:
+        all_traj_keys = sorted(
+            [k for k in f.keys() if k.startswith('trajectory_')],
+            key=lambda x: int(x.split('_')[1]))
+    n_total  = len(all_traj_keys)
+    n_train  = int(n_total * train_ratio)
 
-    rng   = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = torch.utils.data.random_split(
-        ds_full, [n_train, n_val], generator=rng
-    )
+    train_indices = list(range(n_train))
+    val_indices   = list(range(n_train, n_total))
 
+    train_ds = LaserHardening3DDataset(
+        str(h5_path), window_size=window_size, stride=stride,
+        traj_indices=train_indices)
+    val_ds   = LaserHardening3DDataset(
+        str(h5_path), window_size=window_size, stride=stride,
+        traj_indices=val_indices)
+
+    print(train_ds.info())
+    print(f"  → train 窗口={len(train_ds)} | val 窗口={len(val_ds)}")
+
+    gen = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
-        train_ds,
-        batch_size  = batch_size,
-        shuffle     = True,
-        num_workers = num_workers,
-        collate_fn  = collate_fn_3d,
-        drop_last   = True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size  = batch_size,
-        shuffle     = False,
-        num_workers = num_workers,
-        collate_fn  = collate_fn_3d,
-    )
+        train_ds, batch_size=batch_size, shuffle=True,
+        collate_fn=collate_fn_3d, num_workers=num_workers,
+        drop_last=True, generator=gen)
+    val_loader   = DataLoader(
+        val_ds,   batch_size=batch_size, shuffle=False,
+        collate_fn=collate_fn_3d, num_workers=num_workers)
 
-    print(ds_full.info())
-    print(f"  训练样本={n_train}, 验证样本={n_val}, batch_size={batch_size}")
     return train_loader, val_loader
 
 
 def build_single_dataloader_3d(
-    h5_path:      str,
-    batch_size:   int = 4,
-    n_time_steps: int = 20,
-    shuffle:      bool = False,
-    num_workers:  int  = 0,
+    h5_path:     str,
+    batch_size:  int  = 4,
+    window_size: int  = 10,
+    stride:      Optional[int] = None,
+    shuffle:     bool = False,
+    num_workers: int  = 0,
 ) -> DataLoader:
-    """直接从 h5_path 构建单个 DataLoader（用于评测/对比）。"""
-    ds = LaserHardening3DDataset(h5_path, n_time_steps=n_time_steps)
+    """直接从 h5_path 构建 DataLoader（评测用）。"""
+    ds = LaserHardening3DDataset(str(h5_path), window_size=window_size, stride=stride)
     print(ds.info())
     return DataLoader(
-        ds,
-        batch_size  = batch_size,
-        shuffle     = shuffle,
-        num_workers = num_workers,
-        collate_fn  = collate_fn_3d,
-    )
+        ds, batch_size=batch_size, shuffle=shuffle,
+        collate_fn=collate_fn_3d, num_workers=num_workers)
 
 
 # ─────────────────────────────────────────────────────────────────
-# 快速自测
+# 自测
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
-    h5 = sys.argv[1] if len(sys.argv) > 1 else "data_laser_hardening_3d/pde_trajectories_3d_N5000.h5"
-    loader = build_single_dataloader_3d(h5, batch_size=2, n_time_steps=10)
+    h5 = sys.argv[1] if len(sys.argv) > 1 else \
+        "data_laser_hardening_3d/pde_trajectories_3d_N1000.h5"
+
+    for ws, st in [(10, 5), (10, 10), (20, 10)]:
+        ds = LaserHardening3DDataset(h5, window_size=ws, stride=st)
+        print(ds.info())
+        s  = ds[0]
+        print(f"  initial_conditions: {s['initial_conditions'].shape}")
+        print(f"  source_terms:       {s['source_terms'].shape}")
+        print(f"  targets:            {s['targets'].shape}")
+        print()
+
+    loader = build_single_dataloader_3d(h5, batch_size=4, window_size=10, stride=5)
     batch  = next(iter(loader))
-    print("Batch keys:", list(batch.keys()))
-    print("nodes     :", batch["nodes"].shape,         batch["nodes"].dtype)
-    print("tets      :", batch["tets"].shape,          batch["tets"].dtype)
-    print("source_terms:", batch["source_terms"].shape)
-    print("targets   :", batch["targets"].shape)
-    print("L_physics edge_index:", batch["L_physics"]["edge_index"].shape)
+    print("Batch shapes:")
+    print(f"  initial_conditions: {batch['initial_conditions'].shape}")
+    print(f"  source_terms:       {batch['source_terms'].shape}")
+    print(f"  targets:            {batch['targets'].shape}")
     print("自测通过！")
