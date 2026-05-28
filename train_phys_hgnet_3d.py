@@ -125,9 +125,10 @@ def compute_anchor_focus_loss(
 
     temperature = None
     if "initial_conditions" in batch:
-        ic = batch["initial_conditions"].squeeze()
-        temperature = ic[:, 0] if ic.dim() == 2 else ic
-
+        ic = batch["initial_conditions"]   # (B, N, 1)
+        if ic.dim() == 3:
+            ic = ic[0]                     # 取第一个 batch item → (N, 1)
+        temperature = ic[:, 0] if ic.dim() == 2 else ic.squeeze()  # (N,)
     # score_nodes 现在存在并可微
     scores = selector.score_nodes(nodes=nodes, source_q=q, temperature=temperature)
 

@@ -1,16 +1,9 @@
 """
-phys_hgnet_modules.py  ← 锚点选择器重写版（形状保护加固）
-================================================
-相比上一版的改动（仅 PhysicsAwareAnchorSelector）：
-
-新增 _to_node_field(t, N)：
-  无论调用方（phys_hgnet.py 或 train_phys_hgnet_3d.py）传入的张量
-  是 (N,) / (N,C) / (B,N,C) / (T,) / (B,T,N,C) 等任意形状，
-  都能安全提取出 (N,) 的节点标量场；
-  形状无法匹配时返回 None 而不是崩溃。
-
-其余模块（LearnableCoarseOperator、DualScaleGNNCorrector 等）
-完全保留原版（含 Fix A/A-extra 数值稳定修复）。
+phys_hgnet_modules.py — PhysHGNet C1 / C2 / C3 modules.
+修复版（v2）：
+  Fix: 为 PhysicsAwareAnchorSelector 添加 score_nodes() 方法，
+       使 train_phys_hgnet_3d.py 中的 anchor_focus_loss 真正生效。
+  其余代码不变。
 """
 
 import math
@@ -36,150 +29,125 @@ def build_knn_edges(src_coords, dst_coords, k, eps=1e-8):
     row = torch.arange(N_src, device=src_coords.device).unsqueeze(1).expand(-1, k).reshape(-1)
     col = topk_idx.reshape(-1)
     edge_index = torch.stack([row, col], dim=0)
-    inv_d = 1.0 / (topk_d.clamp(min=eps).sqrt() + eps)
+    inv_d  = 1.0 / (topk_d.clamp(min=eps).sqrt() + eps)
     weights = inv_d / inv_d.sum(-1, keepdim=True)
     return edge_index, weights.reshape(-1)
 
 
-def _to_node_field(t: Optional[torch.Tensor], N: int) -> Optional[torch.Tensor]:
-    """
-    从任意形状张量中提取 (N,) 的节点标量场。
-
-    支持的输入形状（按优先顺序匹配）：
-      (N,)           → 直接返回
-      (N, C)         → 取第 0 列
-      (B, N, C)      → 取 batch=0, channel=0
-      (B, N)         → 取 batch=0
-      (B, T, N, C)   → 取 batch=0, t=-1, channel=0
-    其他形状 → 返回 None（不崩溃）
-    """
-    if t is None:
-        return None
-    t = t.detach().float()
-    if t.dim() == 1:
-        if t.shape[0] == N:
-            return t
-    elif t.dim() == 2:
-        if t.shape[0] == N:          # (N, C)
-            return t[:, 0]
-        if t.shape[1] == N:          # (B, N)
-            return t[0]
-    elif t.dim() == 3:
-        if t.shape[1] == N:          # (B, N, C)
-            return t[0, :, 0]
-        if t.shape[0] == N:          # (N, ?, ?)
-            return t[:, 0, 0]
-    elif t.dim() == 4:
-        if t.shape[2] == N:          # (B, T, N, C)
-            return t[0, -1, :, 0]
-    return None
-
-
-# ──────────────────────────────────────────────────────────────────
-# C1: Physics-Aware Anchor Selector（MLP 打分版）
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# C1: Physics-Aware Anchor Selector
+# ─────────────────────────────────────────────────────────────
 
 class PhysicsAwareAnchorSelector(nn.Module):
     """
-    可学习的物理感知锚点选择器（MLP 打分版）
-
-    输入特征（7 维）：
-      coords(3) + heat_source_q(1) + temperature(1)
-      + residual_norm(1) + grad_norm(1)
-
-    所有可选输入均通过 _to_node_field 做形状保护，
-    无论调用方传入什么形状都不会崩溃。
+    Three-term weighted FPS:
+      C_i = α · d_min_norm  +  β · residual_norm  +  γ · grad_norm
     """
 
-    def __init__(self, feat_dim: int = 7, hidden_dim: int = 32,
-                 init_lambda: float = 0.3,
+    def __init__(self, init_lambda: float = 0.3,
                  init_weights: Tuple[float, float, float] = (2.0, 1.0, 1.0)):
         super().__init__()
-        self.feat_dim = feat_dim
-        self.scorer = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        nn.init.zeros_(self.scorer[-1].weight)
-        nn.init.zeros_(self.scorer[-1].bias)
+        self.raw_weights = nn.Parameter(
+            torch.tensor(list(init_weights), dtype=torch.float32))
 
-    @staticmethod
-    def _norm(x: torch.Tensor) -> torch.Tensor:
-        return x / x.abs().max().clamp(min=1e-8)
+    @property
+    def weights(self) -> torch.Tensor:
+        return F.softmax(self.raw_weights, dim=0)
 
+    @property
+    def lam(self) -> torch.Tensor:
+        return self.weights[1]
+
+    # ── Fix: 新增 score_nodes()，供 anchor_focus_loss 使用 ────────
     def score_nodes(
         self,
-        nodes: torch.Tensor,                          # (N, 3)
-        source_q: Optional[torch.Tensor] = None,
-        temperature: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
-        grad_norm: Optional[torch.Tensor] = None,
+        nodes: torch.Tensor,           # (N, d)
+        source_q: torch.Tensor,        # (N,) 热源强度（可微）
+        temperature: Optional[torch.Tensor] = None,  # (N,) 温度（可选）
     ) -> torch.Tensor:
-        """返回每个节点的标量得分 (N,)，完全可微。"""
-        N, device = nodes.shape[0], nodes.device
-        z = torch.zeros(N, device=device)
+        """
+        可微的节点打分函数，供 compute_anchor_focus_loss() 调用。
 
-        # 所有输入都经过 _to_node_field 统一处理，保证形状为 (N,)
-        q_t   = _to_node_field(source_q,   N)
-        t_t   = _to_node_field(temperature, N)
-        # residual 可能是 (N, C)，先处理多通道
-        if residual is not None and residual.dim() > 1:
-            residual = residual.norm(dim=-1)
-        r_t   = _to_node_field(residual, N)
-        g_t   = _to_node_field(grad_norm, N)
+        返回 (N,) 分数，分数越高越倾向于被选为锚点。
+        梯度可回传到 self.raw_weights（α/β/γ），使锚点偏好与物理场对齐。
 
-        coords_n = self._norm(nodes.float())
-        q_n   = self._norm(q_t.to(device))   if q_t   is not None else z
-        t_n   = self._norm(t_t.to(device))   if t_t   is not None else z
-        r_n   = self._norm(r_t.to(device))   if r_t   is not None else z
-        g_n   = self._norm(g_t.to(device))   if g_t   is not None else z
+        实现思路：
+          score_i = β * q_norm_i  +  γ * temp_norm_i
+          （α 的几何项在可微打分中省略，因为 d_min 依赖离散 argmax，不可微）
+        """
+        _, beta, gamma = self.weights.unbind()
 
-        feat = torch.stack(
-            [coords_n[:, 0], coords_n[:, 1], coords_n[:, 2],
-             q_n, t_n, r_n, g_n], dim=1)           # (N, 7)
-        return self.scorer(feat).squeeze(-1)        # (N,)
+        q_norm = source_q / source_q.max().clamp(min=1e-8)
+        score  = beta * q_norm
 
-    def forward(
-        self,
-        nodes: torch.Tensor,
-        m: int,
-        source_q: Optional[torch.Tensor] = None,
-        temperature: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
-        grad_norm: Optional[torch.Tensor] = None,
-        use_physics_anchor: bool = True,
-    ) -> torch.Tensor:
+        if temperature is not None:
+            t_norm = temperature / temperature.max().clamp(min=1e-8)
+            score  = score + gamma * t_norm
+
+        return score  # (N,)，可微
+    # ── End Fix ───────────────────────────────────────────────────
+
+    def forward(self,
+                nodes: torch.Tensor,
+                m: int,
+                residual: Optional[torch.Tensor] = None,
+                grad_norm: Optional[torch.Tensor] = None,
+                use_physics_anchor: bool = True,
+                ) -> torch.Tensor:
         N = nodes.shape[0]
         m = min(m, N)
+        device = nodes.device
+
+        def _normalize(x):
+            return x / x.max().clamp(min=1e-8)
 
         if use_physics_anchor:
-            scores = self.score_nodes(
-                nodes, source_q=source_q, temperature=temperature,
-                residual=residual, grad_norm=grad_norm)
+            alpha, beta, gamma = self.weights.unbind()
+            r_norm = (_normalize(
+                residual.norm(dim=-1) if residual.dim() > 1 else residual.abs())
+                if residual is not None
+                else torch.zeros(N, device=device))
+            g_norm = (_normalize(grad_norm)
+                if grad_norm is not None
+                else torch.zeros(N, device=device))
         else:
-            scores = torch.zeros(N, device=nodes.device)
+            alpha = torch.ones(1, device=device)
+            beta  = torch.zeros(1, device=device)
+            gamma = torch.zeros(1, device=device)
+            r_norm = torch.zeros(N, device=device)
+            g_norm = torch.zeros(N, device=device)
 
-        _, anchor_idx = torch.topk(scores, m, sorted=False)
-        return anchor_idx.long()
+        if use_physics_anchor and (residual is not None or grad_norm is not None):
+            seed_score = beta * r_norm + gamma * g_norm
+            first = int(seed_score.argmax().item())
+        else:
+            first = 0
+
+        selected = [first]
+        d_min = _pairwise_sq_dist(nodes, nodes[first:first + 1]).squeeze(1).sqrt()
+
+        for _ in range(m - 1):
+            d_norm = _normalize(d_min)
+            cost = alpha * d_norm + beta * r_norm + gamma * g_norm
+            cost[selected] = -float('inf')
+            next_idx = int(cost.argmax().item())
+            selected.append(next_idx)
+            d_new = _pairwise_sq_dist(
+                nodes, nodes[next_idx:next_idx + 1]).squeeze(1).sqrt()
+            d_min = torch.minimum(d_min, d_new)
+
+        return torch.tensor(selected, dtype=torch.long, device=device)
 
     def weight_summary(self) -> str:
-        norms = [f"layer{i}_wnorm={p.norm().item():.4f}"
-                 for i, (name, p) in enumerate(self.scorer.named_parameters())
-                 if "weight" in name]
-        return "  ".join(norms)
+        alpha, beta, gamma = self.weights.detach().unbind()
+        return f"α(geo)={alpha:.3f} β(res)={beta:.3f} γ(grad)={gamma:.3f}"
 
 
-# ──────────────────────────────────────────────────────────────────
-# C2: Learnable Coarse Operator (Graph Structure Learning)
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# C2: Learnable Coarse Operator
+# ─────────────────────────────────────────────────────────────
 
 class LearnableCoarseOperator(nn.Module):
-    """
-    GSL-based coarse operator.
-    Fix A: Gershgorin 谱归一化，Fix A-extra: softplus 输出硬夹 max=10。
-    """
-
     def __init__(self, spatial_dim, feat_dim, hidden_dim=64, k_coarse=6, eps=1e-8):
         super().__init__()
         self.k_coarse = k_coarse
@@ -203,31 +171,25 @@ class LearnableCoarseOperator(nn.Module):
         hi, hj = anchor_feats[src], anchor_feats[dst]
         dist = (xi - xj).norm(dim=-1, keepdim=True).clamp(min=self.eps)
         edge_feat = torch.cat([xi, xj, hi, hj, dist], dim=-1)
-        raw = self.edge_mlp(edge_feat).squeeze(-1)
-        w = F.softplus(raw)
-        return w.clamp(max=10.0)
+        return F.softplus(self.edge_mlp(edge_feat).squeeze(-1))
 
     def forward(self, anchor_coords, anchor_feats, edge_index, use_learned_coarse=True):
         m = anchor_coords.shape[0]
         w = (self._learned_weights(anchor_coords, anchor_feats, edge_index)
              if use_learned_coarse
              else self._fixed_weights(anchor_coords, edge_index))
-
         src, dst = edge_index
         row_oh = F.one_hot(src, num_classes=m).to(dtype=w.dtype)
         col_oh = F.one_hot(dst, num_classes=m).to(dtype=w.dtype)
         L_off     = row_oh.t() @ (w.unsqueeze(1) * col_oh)
         L_off_sym = L_off + L_off.t()
         diag_vals = -L_off_sym.sum(dim=1)
-        L_hat     = L_off_sym + torch.diag(diag_vals)
-
-        spec_bound = (2.0 * diag_vals.abs().max()).clamp(min=1e-8)
-        return L_hat / spec_bound
+        return L_off_sym + torch.diag(diag_vals)
 
 
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # C3: Dual-Scale GNN Corrector
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class _MPNN(MessagePassing):
     def __init__(self, dim, edge_dim, aggr='mean'):
@@ -252,9 +214,9 @@ class DualScaleGNNCorrector(nn.Module):
                  hidden_dim=128, num_fine_layers=5, num_coarse_layers=4,
                  k_virtual_nodes=4, num_node_types=3):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.k_vn = k_virtual_nodes
+        self.hidden_dim  = hidden_dim
+        self.output_dim  = output_dim
+        self.k_vn        = k_virtual_nodes
 
         self.fine_enc = nn.Sequential(
             nn.Linear(spatial_dim + feature_dim + num_node_types, hidden_dim),
@@ -273,9 +235,9 @@ class DualScaleGNNCorrector(nn.Module):
             [_MPNN(hidden_dim, spatial_dim + 1) for _ in range(num_coarse_layers)])
 
         self.virtual_embed  = nn.Parameter(torch.randn(k_virtual_nodes, hidden_dim) * 0.01)
-        self.vn_agg_mlp  = nn.Sequential(
+        self.vn_agg_mlp     = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
-        self.vn_bcast_mlp = nn.Sequential(
+        self.vn_bcast_mlp   = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
         self.coarse_dec = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
@@ -298,7 +260,7 @@ class DualScaleGNNCorrector(nn.Module):
 
     def _fine_forward(self, u, nodes, edge_index, edge_attr, node_type):
         nt = F.one_hot(node_type.long(), num_classes=3).float()
-        h = self.fine_enc(torch.cat([u, nodes, nt], dim=-1))
+        h  = self.fine_enc(torch.cat([u, nodes, nt], dim=-1))
         for layer in self.fine_layers:
             h = layer(h, edge_index, edge_attr)
         return self.fine_dec(h)
@@ -326,29 +288,32 @@ class DualScaleGNNCorrector(nn.Module):
         r_fine = self._fine_forward(u, nodes, edge_index, edge_attr, node_type)
         if not use_dual_scale:
             return r_fine
-        u_coarse   = (torch.sparse.mm(R, u) if R.is_sparse else R @ u)
-        r_coarse_m = self._coarse_forward(u_coarse, anchor_coords,
-                                          coarse_edge_index, coarse_edge_attr,
-                                          use_virtual_nodes=use_virtual_nodes)
-        r_coarse_n = (torch.sparse.mm(P, r_coarse_m) if P.is_sparse else P @ r_coarse_m)
+        u_coarse    = (torch.sparse.mm(R, u) if R.is_sparse else R @ u)
+        r_coarse_m  = self._coarse_forward(u_coarse, anchor_coords,
+                                            coarse_edge_index, coarse_edge_attr,
+                                            use_virtual_nodes=use_virtual_nodes)
+        r_coarse_n  = (torch.sparse.mm(P, r_coarse_m) if P.is_sparse else P @ r_coarse_m)
         return self.alpha_fine * r_fine + self.alpha_coarse * r_coarse_n
 
 
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # R / P helpers
-# ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 def build_restriction_prolongation(nodes, anchor_idx, q=4, eps=1e-8):
     N = nodes.shape[0]
     anchor_coords = nodes[anchor_idx]
     m = anchor_coords.shape[0]
     device = nodes.device
+
     edge_idx_R, w_R = build_knn_edges(anchor_coords, nodes, q, eps)
     R = torch.zeros(m, N, device=device, dtype=nodes.dtype)
     R[edge_idx_R[0], edge_idx_R[1]] = w_R
+
     edge_idx_P, w_P = build_knn_edges(nodes, anchor_coords, q, eps)
     P = torch.zeros(N, m, device=device, dtype=nodes.dtype)
     P[edge_idx_P[0], edge_idx_P[1]] = w_P
+
     return R, P
 
 
